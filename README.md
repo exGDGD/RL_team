@@ -1,4 +1,116 @@
-# RL_team
+# RL Team
 
-1. 작성한 파일 repo에 push
-2. colab notebook에서 VM에 연결한 뒤 clone해서 실행
+Heterogeneous CPU scheduling을 위한 multi-agent reinforcement learning 실험 repo입니다.
+
+초기 구현 목표는 SimPy 기반 이산 이벤트 시뮬레이터를 만들고, PettingZoo multi-agent API로 감싸서 학습/평가 코드와 연결하는 것입니다.
+
+## Environment Setup
+
+팀 공통 환경은 conda로 관리합니다. 환경 이름은 `rl-team`입니다.
+
+```bash
+conda env create -f environment.yml
+conda activate rl-team
+```
+
+이미 환경을 만든 뒤 `environment.yml`이 바뀌었다면 다음 명령으로 갱신합니다.
+
+```bash
+conda env update -f environment.yml --prune
+conda activate rl-team
+```
+
+설치가 잘 되었는지 확인합니다.
+
+```bash
+python -c "import simpy, pettingzoo, gymnasium, numpy; print('env ok')"
+pytest -q
+```
+
+`environment.yml`은 Python과 pip 환경을 만들고, 실제 Python 패키지는 `requirements.txt`에서 설치합니다. 이렇게 두면 conda solver가 RL 패키지 의존성 해석에 오래 걸리는 문제를 줄일 수 있습니다.
+
+### Optional venv Setup
+
+conda를 쓰기 어려운 환경에서는 Python 3.12 기준으로 venv를 사용할 수 있습니다.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1  # Windows PowerShell
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+`.venv/`는 각자 로컬에서만 생성하고 git에는 올리지 않습니다.
+
+## Planned Stack
+
+- `simpy`: task arrival, CPU burst, I/O wait 같은 비동기 이벤트 시뮬레이션
+- `pettingzoo`: multi-agent environment API
+- `gymnasium.spaces`: observation/action space 정의
+- `numpy`: state/reward/metric 계산
+- `pytest`: 환경 동작 단위 테스트
+
+## Current Structure
+
+```text
+src/env/
+  core.py           # heterogeneous core specs and runtime state
+  metrics.py        # throughput, energy, latency, starvation, utilization metrics
+  spaces.py         # Gymnasium observation/action space definitions
+  task.py           # task phases, latency class, progress tracking
+  workload.py       # stochastic task generator
+  scheduler_env.py  # first-pass SimPy event-driven scheduler env
+tests/
+  test_scheduler_env.py
+```
+
+현재 `SchedulerEnv`는 PettingZoo `ParallelEnv`와 비슷한 dict 기반 입출력을 반환합니다. 정식 PettingZoo wrapper는 core simulator가 안정화된 뒤 얹을 예정입니다.
+
+## Environment Semantics
+
+- `episode_time`은 task arrival horizon입니다. 이 시점 이후 새 task는 생성하지 않지만, 이미 생성된 task는 완료될 때까지 drain합니다.
+- `max_sim_time`은 무한 루프/비정상 trace를 막기 위한 truncation guard입니다.
+- reward mode는 두 가지를 지원합니다. `event_cost`는 CPU burst마다 energy/starvation cost를 주고 task 완료 시 completion/latency reward를 줍니다. `completion_only`는 비용을 누적했다가 task 완료 시 모든 reward를 한 번에 줍니다.
+- action은 step 시작 시점의 ready queue snapshot을 기준으로 해석합니다.
+- 여러 idle core가 같은 task를 고르면 agent order가 빠른 core만 배정받고, 뒤의 중복 선택은 conflict/NO-OP 처리합니다.
+
+## Observation and Action Space
+
+`SchedulerEnv.action_space(agent_id)`는 `Discrete(queue_size + 1)`입니다. `0`은 NO-OP이고, `1..queue_size`는 ready queue slot 선택입니다.
+
+`SchedulerEnv.observation_space(agent_id)`는 다음 key를 가진 `gymnasium.spaces.Dict`입니다.
+
+- `self`: `(5,)` core type, busy flag, current task elapsed time, accumulated energy, time since last decision
+- `ready_queue`: `(queue_size, 4)` waiting time, CPU progress, latency class, CPU intensity
+- `ready_mask`: `(queue_size,)`
+- `other_cores`: `(num_cores - 1, 3)` core type, busy flag, current task elapsed time
+- `system`: `(6,)` total core count, utilization, 4-way core type counts
+- `action_mask`: `(queue_size + 1,)`
+
+## Metrics
+
+`SchedulerEnv.metrics()`와 `info["metrics"]`는 다음 episode-level 지표를 제공합니다.
+
+- throughput
+- total energy
+- mean/p95/p99 response time
+- mean/p95 ready wait time
+- starvation rate
+- mean utilization
+- per-core utilization
+
+## Collaboration Flow
+
+1. 작업 전 repo를 최신 상태로 맞춥니다.
+2. `conda activate rl-team`으로 가상환경을 활성화합니다.
+3. 구현/테스트 후 필요한 파일만 commit합니다.
+4. `.venv`, generated trace, training output은 commit하지 않습니다.
+
+## notes
+Main experiment v0(현재 버전):
+  Global ready queue
+  목적: heterogeneous core-task assignment 정책 검증
+
+Extension / ablation v1:
+  Per-core local queue + work stealing
+  목적: 더 현실적인 OS scheduling 구조에서 정책이 유지되는지 검증
