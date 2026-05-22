@@ -13,6 +13,7 @@ def test_compute_episode_metrics_from_completed_tasks_and_cores() -> None:
     )
     task_a.total_ready_wait_time = 2.0
     task_a.max_ready_wait_time = 2.0
+    task_a.first_started_at = 2.0
     task_a.completed_at = 10.0
 
     task_b = Task(
@@ -24,6 +25,7 @@ def test_compute_episode_metrics_from_completed_tasks_and_cores() -> None:
     )
     task_b.total_ready_wait_time = 12.0
     task_b.max_ready_wait_time = 12.0
+    task_b.first_started_at = 17.0
     task_b.completed_at = 25.0
 
     core = Core(core_id="p_0", core_type=CoreType.P)
@@ -41,7 +43,8 @@ def test_compute_episode_metrics_from_completed_tasks_and_cores() -> None:
     assert metrics.completed_tasks == 2
     assert metrics.throughput == pytest.approx(0.04)
     assert metrics.total_energy == pytest.approx(100.0)
-    assert metrics.mean_response_time == pytest.approx(15.0)
+    assert metrics.mean_response_time == pytest.approx(7.0)
+    assert metrics.mean_turnaround_time == pytest.approx(15.0)
     assert metrics.mean_ready_wait_time == pytest.approx(7.0)
     assert metrics.starvation_rate == pytest.approx(0.5)
     assert metrics.mean_utilization == pytest.approx(0.4)

@@ -66,11 +66,19 @@ tests/
 
 현재 `SchedulerEnv`는 PettingZoo `ParallelEnv`와 비슷한 dict 기반 입출력을 반환합니다. 정식 PettingZoo wrapper는 core simulator가 안정화된 뒤 얹을 예정입니다.
 
+## SchedulerEnv Overview
+
+`SchedulerEnv`는 SimPy 기반 이산 이벤트 시뮬레이터입니다. `reset()`에서 stochastic workload trace를 만들고, task arrival 또는 I/O completion으로 ready queue에 작업이 생긴 뒤 idle core가 있으면 decision point에서 멈춥니다.
+
+`step(actions)`는 agent/core별 action을 받아 ready queue task를 core에 배정하고, CPU burst completion, I/O wait, 다음 task arrival 중 가장 이른 이벤트까지 simulated time을 진행합니다. 이 과정을 episode가 terminate/truncate될 때까지 반복합니다.
+
 ## Environment Semantics
 
 - `episode_time`은 task arrival horizon입니다. 이 시점 이후 새 task는 생성하지 않지만, 이미 생성된 task는 완료될 때까지 drain합니다.
 - `max_sim_time`은 무한 루프/비정상 trace를 막기 위한 truncation guard입니다.
-- reward mode는 두 가지를 지원합니다. `event_cost`는 CPU burst마다 energy/starvation cost를 주고 task 완료 시 completion/latency reward를 줍니다. `completion_only`는 비용을 누적했다가 task 완료 시 모든 reward를 한 번에 줍니다.
+- reward mode는 세 가지를 지원합니다. 기본값인 `event_shaped`는 CPU burst마다 CPU work progress reward와 energy/starvation cost를 주고, task 완료 시 task completion/work reward와 latency penalty를 줍니다. `event_cost`는 progress reward 없이 event cost와 completion reward만 사용합니다. `completion_only`는 비용을 누적했다가 task 완료 시 모든 reward를 한 번에 줍니다.
+- completion reward는 task 개수 보상과 CPU work량 보상을 분리합니다. I/O wait은 completion reward 크기에 직접 포함하지 않습니다.
+- latency penalty는 task 전체 완료 지연인 turnaround time 기준입니다.
 - action은 step 시작 시점의 ready queue snapshot을 기준으로 해석합니다.
 - 여러 idle core가 같은 task를 고르면 agent order가 빠른 core만 배정받고, 뒤의 중복 선택은 conflict/NO-OP 처리합니다.
 
@@ -94,6 +102,7 @@ tests/
 - throughput
 - total energy
 - mean/p95/p99 response time
+- mean/p95/p99 turnaround time
 - mean/p95 ready wait time
 - starvation rate
 - mean utilization

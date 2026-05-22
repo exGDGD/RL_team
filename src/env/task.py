@@ -21,6 +21,7 @@ class Task:
     cpu_progress: float = 0.0
     current_burst_idx: int = 0
     ready_since: float | None = None
+    first_started_at: float | None = None
     completed_at: float | None = None
     accumulated_energy_cost: float = 0.0
     accumulated_starvation_cost: float = 0.0
@@ -60,6 +61,8 @@ class Task:
         self.ready_since = now
 
     def mark_dispatched(self, now: float) -> None:
+        if self.first_started_at is None:
+            self.first_started_at = now
         wait_time = self.waiting_time(now)
         self.total_ready_wait_time += wait_time
         self.max_ready_wait_time = max(self.max_ready_wait_time, wait_time)
@@ -80,6 +83,13 @@ class Task:
         return io_wait
 
     def response_time(self) -> float | None:
+        """Time from arrival until the task first receives CPU service."""
+        if self.first_started_at is None:
+            return None
+        return self.first_started_at - self.arrival_time
+
+    def turnaround_time(self) -> float | None:
+        """Time from arrival until full task completion."""
         if self.completed_at is None:
             return None
         return self.completed_at - self.arrival_time

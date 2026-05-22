@@ -105,6 +105,8 @@ def test_info_includes_episode_metrics() -> None:
     assert info["metrics"]["total_tasks"] == info["total_tasks"]
     assert "throughput" in info["metrics"]
     assert "total_energy" in info["metrics"]
+    assert "mean_response_time" in info["metrics"]
+    assert "mean_turnaround_time" in info["metrics"]
 
 
 def test_duplicate_task_selection_is_resolved_as_conflict() -> None:
@@ -177,7 +179,13 @@ def test_max_sim_time_truncates_unfinished_trace() -> None:
 def test_event_cost_reward_mode_emits_cost_before_task_completion() -> None:
     env = SchedulerEnv(
         reward_mode=RewardMode.EVENT_COST,
-        reward_weights=RewardWeights(completion=10.0, energy=1.0, starvation=1.0, latency=1.0),
+        reward_weights=RewardWeights(
+            completion=10.0,
+            completion_work=0.0,
+            energy=1.0,
+            starvation=1.0,
+            latency=1.0,
+        ),
     )
     task = Task(
         pid=0,
@@ -190,6 +198,7 @@ def test_event_cost_reward_mode_emits_cost_before_task_completion() -> None:
 
     reward = env._reward_for_finished_burst(
         task=task,
+        cpu_work_done=1.0,
         energy_cost=2.0,
         starvation_cost=3.0,
     )
@@ -200,7 +209,13 @@ def test_event_cost_reward_mode_emits_cost_before_task_completion() -> None:
 def test_completion_only_reward_mode_waits_until_task_completion() -> None:
     env = SchedulerEnv(
         reward_mode=RewardMode.COMPLETION_ONLY,
-        reward_weights=RewardWeights(completion=10.0, energy=1.0, starvation=1.0, latency=1.0),
+        reward_weights=RewardWeights(
+            completion=10.0,
+            completion_work=0.0,
+            energy=1.0,
+            starvation=1.0,
+            latency=1.0,
+        ),
     )
     task = Task(
         pid=0,
@@ -214,15 +229,49 @@ def test_completion_only_reward_mode_waits_until_task_completion() -> None:
 
     mid_reward = env._reward_for_finished_burst(
         task=task,
+        cpu_work_done=1.0,
         energy_cost=2.0,
         starvation_cost=3.0,
     )
     task.completed_at = 10.0
     completion_reward = env._reward_for_finished_burst(
         task=task,
+        cpu_work_done=1.0,
         energy_cost=0.0,
         starvation_cost=0.0,
     )
 
     assert mid_reward == 0.0
     assert completion_reward == -5.0
+
+
+def test_event_shaped_reward_mode_adds_cpu_work_progress() -> None:
+    env = SchedulerEnv(
+        reward_mode=RewardMode.EVENT_SHAPED,
+        reward_weights=RewardWeights(
+            progress_work=2.0,
+            completion=10.0,
+            completion_work=0.0,
+            energy=1.0,
+            starvation=1.0,
+            latency=1.0,
+            work_norm=2.0,
+        ),
+    )
+    task = Task(
+        pid=0,
+        arrival_time=0.0,
+        cpu_intensity=0.5,
+        latency_class=LatencyClass.SOFT_RT,
+        cpu_bursts=[1.0, 1.0],
+        io_waits=[1.0],
+    )
+
+    reward = env._reward_for_finished_burst(
+        task=task,
+        cpu_work_done=1.0,
+        energy_cost=2.0,
+        starvation_cost=3.0,
+    )
+
+    assert reward == -4.0

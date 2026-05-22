@@ -19,6 +19,9 @@ class EpisodeMetrics:
     mean_response_time: float | None
     p95_response_time: float | None
     p99_response_time: float | None
+    mean_turnaround_time: float | None
+    p95_turnaround_time: float | None
+    p99_turnaround_time: float | None
     mean_ready_wait_time: float | None
     p95_ready_wait_time: float | None
     starvation_rate: float | None
@@ -39,7 +42,10 @@ def compute_episode_metrics(
     task_list = list(tasks)
     completed = [task for task in task_list if task.done]
     response_times = [
-        task.response_time() for task in completed if task.response_time() is not None
+        task.response_time() for task in task_list if task.response_time() is not None
+    ]
+    turnaround_times = [
+        task.turnaround_time() for task in completed if task.turnaround_time() is not None
     ]
     ready_wait_times = [task.total_ready_wait_time for task in completed]
     max_ready_wait_times = [task.max_ready_wait_time for task in completed]
@@ -56,6 +62,9 @@ def compute_episode_metrics(
         mean_response_time=_mean(response_times),
         p95_response_time=_percentile(response_times, 95),
         p99_response_time=_percentile(response_times, 99),
+        mean_turnaround_time=_mean(turnaround_times),
+        p95_turnaround_time=_percentile(turnaround_times, 95),
+        p99_turnaround_time=_percentile(turnaround_times, 99),
         mean_ready_wait_time=_mean(ready_wait_times),
         p95_ready_wait_time=_percentile(ready_wait_times, 95),
         starvation_rate=_starvation_rate(max_ready_wait_times, starvation_threshold),

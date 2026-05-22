@@ -24,19 +24,30 @@ DEFAULT_CORE_CONFIG = {
 
 @dataclass(frozen=True)
 class RewardWeights:
-    completion: float = 10.0
+    progress_work: float = 1.0
+    completion: float = 5.0
+    completion_work: float = 5.0
     energy: float = 0.1
     starvation: float = 0.001
     latency: float = 0.05
+    context_switch: float = 1.0
+    work_norm: float = 10.0
+    starvation_wait_clip: float = 100.0
+    starvation_power: float = 2.0
 
 
 class RewardMode(str, Enum):
+    EVENT_SHAPED = "event_shaped"
     EVENT_COST = "event_cost"
     COMPLETION_ONLY = "completion_only"
 
 
 class SchedulerEnv:
-    """First-pass event-driven CPU scheduling environment.
+    """Event-driven heterogeneous CPU scheduling simulator.
+
+    The environment generates a finite task trace, advances simulated time to
+    the next scheduling decision, asks idle cores to select ready-queue slots,
+    then runs CPU/I/O events until the next decision point.
 
     The public API intentionally resembles PettingZoo's ParallelEnv shape:
     actions and observations are dictionaries keyed by core/agent id.
@@ -45,8 +56,10 @@ class SchedulerEnv:
     - An action selects from the ready-queue snapshot visible at step start.
     - If multiple idle cores select the same task, the earliest agent in
       deterministic agent order wins and later duplicate claims become NO-OP.
-    - RewardMode.EVENT_COST emits energy/starvation cost at each CPU burst and
-      completion/latency terms when the task finishes.
+    - RewardMode.EVENT_SHAPED emits CPU-work progress and energy/starvation
+      cost at each burst, then completion/latency terms when the task finishes.
+    - RewardMode.EVENT_COST omits progress shaping but keeps event costs and
+      completion/latency terms.
     - RewardMode.COMPLETION_ONLY accumulates burst costs internally and emits
       all reward terms only when the task finishes.
     - episode_time is the workload arrival horizon. Episodes terminate after the
@@ -66,7 +79,7 @@ class SchedulerEnv:
         max_tasks: int = 64,
         seed: int | None = None,
         reward_weights: RewardWeights | None = None,
-        reward_mode: RewardMode | str = RewardMode.EVENT_COST,
+        reward_mode: RewardMode | str = RewardMode.EVENT_SHAPED,
     ) -> None:
         self.core_config = core_config or DEFAULT_CORE_CONFIG
         self.queue_size = queue_size
@@ -164,6 +177,7 @@ class SchedulerEnv:
             "completed_tasks": len(self.completed_tasks),
             "total_tasks": len(self.tasks),
             "mean_response_time": self._mean_response_time(),
+            "mean_turnaround_time": self._mean_turnaround_time(),
             "metrics": metrics.as_dict(),
             "assignments": dict(self._last_step_info["assignments"]),
             "conflicts": dict(self._last_step_info["conflicts"]),
@@ -299,6 +313,7 @@ class SchedulerEnv:
             task = self.tasks[pid]
             core.release(self.sim.now, run_time)
 
+            cpu_work_done = task.current_cpu_burst
             energy_cost, starvation_cost = self._burst_costs(core, run_time)
             task.accumulate_costs(
                 energy_cost=energy_cost,
@@ -307,6 +322,7 @@ class SchedulerEnv:
             io_wait = task.finish_current_burst(self.sim.now)
             reward = self._reward_for_finished_burst(
                 task=task,
+                cpu_work_done=cpu_work_done,
                 energy_cost=energy_cost,
                 starvation_cost=starvation_cost,
             )
@@ -330,36 +346,59 @@ class SchedulerEnv:
         return 1.0
 
     def _burst_costs(self, core: Core, run_time: float) -> tuple[float, float]:
+        weights = self.reward_weights
         energy_cost = core.spec.power * run_time
-        starvation_cost = sum(t.waiting_time(self.sim.now) ** 2 for t in self.ready_queue) * run_time
+        starvation_cost = (
+            sum(
+                min(t.waiting_time(self.sim.now), weights.starvation_wait_clip)
+                ** weights.starvation_power
+                for t in self.ready_queue
+            )
+            * run_time
+        )
         return energy_cost, starvation_cost
 
     def _reward_for_finished_burst(
         self,
         task: Task,
+        cpu_work_done: float,
         energy_cost: float,
         starvation_cost: float,
     ) -> float:
         weights = self.reward_weights
         latency_cost = 0.0
-        if task.done and task.response_time() is not None:
-            latency_cost = float(task.latency_class) * task.response_time()
+        if task.done and task.turnaround_time() is not None:
+            latency_cost = float(task.latency_class) * task.turnaround_time()
+        event_cost = -weights.energy * energy_cost - weights.starvation * starvation_cost
+        completion_reward = 0.0
+        if task.done:
+            completion_reward = (
+                weights.completion
+                + weights.completion_work
+                * self._normalized_work(task.total_cpu_required)
+                - weights.latency * latency_cost
+            )
+
+        if self.reward_mode == RewardMode.EVENT_SHAPED:
+            progress_reward = weights.progress_work * self._normalized_work(cpu_work_done)
+            return progress_reward + event_cost + completion_reward
 
         if self.reward_mode == RewardMode.EVENT_COST:
-            reward = -weights.energy * energy_cost - weights.starvation * starvation_cost
-            if task.done:
-                reward += weights.completion - weights.latency * latency_cost
-            return reward
+            return event_cost + completion_reward
 
         if not task.done:
             return 0.0
 
         return (
             weights.completion
+            + weights.completion_work * self._normalized_work(task.total_cpu_required)
             - weights.energy * task.accumulated_energy_cost
             - weights.starvation * task.accumulated_starvation_cost
             - weights.latency * latency_cost
         )
+
+    def _normalized_work(self, work: float) -> float:
+        return float(work / max(self.reward_weights.work_norm, 1e-8))
 
     def _observe_agent(self, agent_id: str) -> dict[str, Any]:
         core = self.cores[agent_id]
@@ -440,6 +479,13 @@ class SchedulerEnv:
     def _mean_response_time(self) -> float | None:
         response_times = [task.response_time() for task in self.completed_tasks]
         valid = [value for value in response_times if value is not None]
+        if not valid:
+            return None
+        return float(np.mean(valid))
+
+    def _mean_turnaround_time(self) -> float | None:
+        turnaround_times = [task.turnaround_time() for task in self.completed_tasks]
+        valid = [value for value in turnaround_times if value is not None]
         if not valid:
             return None
         return float(np.mean(valid))
