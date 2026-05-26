@@ -61,6 +61,8 @@ src/env/
   workload.py       # stochastic task generator
   scheduler_env.py  # first-pass SimPy event-driven scheduler env
 tests/
+  test_baselines.py
+  test_metrics.py
   test_scheduler_env.py
 ```
 
@@ -107,6 +109,21 @@ tests/
 - starvation rate
 - mean utilization
 - per-core utilization
+
+## Baselines
+
+현재 baseline policy는 `src/baselines/`에 있습니다.
+
+- `RandomPolicy`: valid ready-queue slot 중 무작위 선택
+- `RoundRobinPolicy`: ready-queue slot을 순환 선택
+- `SJFLikePolicy`: 현재 CPU burst runtime이 가장 짧은 task 선택
+- `EASLikePolicy`: latency criticality, CPU intensity, core type affinity를 이용한 휴리스틱
+
+간단한 multi-seed baseline 비교는 다음 명령으로 실행합니다. 출력값은 평균 `+/-` 표준편차 형식입니다.
+
+```bash
+python -m src.evaluate_baselines
+```
 
 ## Collaboration Flow
 
