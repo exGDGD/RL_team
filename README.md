@@ -125,6 +125,12 @@ tests/
 python -m src.evaluate_baselines
 ```
 
+## RL / Colab Smoke Test
+
+로컬 가상환경은 simulator, baseline, numpy 기반 RL interface 테스트를 가볍게 돌리는 용도로 둡니다. PyTorch actor/critic forward pass와 이후 학습 실험은 Colab에서 실행합니다.
+
+Colab에서는 `notebooks/acac_colab_smoke.ipynb`를 열고 위에서부터 실행하면 됩니다. 노트북은 repo를 clone한 뒤 `tests/test_rl_*`를 실행하고, `TypeSharedActor`, `AgentCentricCritic`, async rollout collector, PPO/ACAC update step이 서로 연결되는지 확인합니다.
+
 ## Collaboration Flow
 
 1. 작업 전 repo를 최신 상태로 맞춥니다.
