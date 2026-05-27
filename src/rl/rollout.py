@@ -36,6 +36,10 @@ def collect_episode(
         for agent_id in batch.decision_agent_ids():
             agent_index = batch.agent_ids.index(agent_id)
             action = int(chosen_actions.get(agent_id, 0))
+            if action == 0:
+                continue
+            if agent_id in pending:
+                raise RuntimeError(f"Agent {agent_id} has an unfinished pending decision.")
             actions[agent_id] = action
             pending[agent_id] = PendingDecision(
                 agent_id=agent_id,
@@ -55,6 +59,9 @@ def collect_episode(
             pending=pending,
             buffer=buffer,
             rewards=rewards,
+            finished_agent_ids={
+                event["core_id"] for event in next_info.get("finished_runs", [])
+            },
             next_batch=next_batch,
             next_time=float(next_info["time"]),
             terminated=terminated,
@@ -70,6 +77,7 @@ def collect_episode(
         pending=pending,
         buffer=buffer,
         rewards={agent_id: 0.0 for agent_id in env.agents},
+        finished_agent_ids=set(),
         next_batch=batch,
         next_time=float(info["time"]),
         terminated=False,
@@ -83,6 +91,7 @@ def _close_finished_decisions(
     pending: dict[str, PendingDecision],
     buffer: RolloutBuffer,
     rewards: dict[str, float],
+    finished_agent_ids: set[str],
     next_batch: AgentBatch,
     next_time: float,
     terminated: bool,
@@ -91,8 +100,8 @@ def _close_finished_decisions(
     for agent_id, decision in list(pending.items()):
         next_agent_index = next_batch.agent_ids.index(agent_id)
         agent_is_idle = next_batch.self_features[next_agent_index, 1] == 0.0
-        has_reward = float(rewards.get(agent_id, 0.0)) != 0.0
-        if not (terminated or truncated or agent_is_idle or has_reward):
+        finished_run = agent_id in finished_agent_ids
+        if not (terminated or truncated or agent_is_idle or finished_run):
             continue
 
         buffer.append(

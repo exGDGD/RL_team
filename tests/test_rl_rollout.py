@@ -13,6 +13,14 @@ class FirstValidPolicy:
         return actions, log_probs
 
 
+class NoOpPolicy:
+    def act(self, batch: AgentBatch) -> tuple[dict[str, int], dict[str, float]]:
+        return (
+            {agent_id: 0 for agent_id in batch.agent_ids},
+            {agent_id: 0.0 for agent_id in batch.agent_ids},
+        )
+
+
 def test_collect_episode_returns_agent_centric_transitions() -> None:
     env = SchedulerEnv(
         core_config={CoreType.P: 1, CoreType.E: 1},
@@ -29,3 +37,18 @@ def test_collect_episode_returns_agent_centric_transitions() -> None:
     assert all(transition.agent_id in env.agents for transition in buffer.transitions)
     assert all(transition.elapsed_time >= 0.0 for transition in buffer.transitions)
     assert env.completed_tasks
+
+
+def test_collect_episode_does_not_store_noop_as_pending_macro_action() -> None:
+    env = SchedulerEnv(
+        core_config={CoreType.P: 1},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=0.5,
+        episode_time=30.0,
+        max_tasks=4,
+        seed=3,
+    )
+
+    buffer = collect_episode(env, NoOpPolicy(), seed=3, max_env_steps=3)
+
+    assert len(buffer) == 0

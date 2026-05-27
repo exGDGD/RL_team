@@ -131,6 +131,14 @@ python -m src.evaluate_baselines
 
 Colab에서는 `notebooks/acac_colab_smoke.ipynb`를 열고 위에서부터 실행하면 됩니다. 노트북은 repo를 clone한 뒤 `tests/test_rl_*`를 실행하고, `TypeSharedActor`, `AgentCentricCritic`, async rollout collector, PPO/ACAC update step이 서로 연결되는지 확인합니다.
 
+Single-config sanity training은 Colab에서 다음처럼 실행합니다.
+
+```bash
+python -m src.train_acac --episodes 100 --eval-every 10
+```
+
+현재 학습 entrypoint는 `P2E2 + balanced workload` 고정 구성으로 시작합니다. `SchedulerEnv`의 NO-OP는 아직 idle duration을 진행시키지 않으므로, 초기 ACAC sanity training에서는 NO-OP sampling을 비활성화합니다.
+
 ## Collaboration Flow
 
 1. 작업 전 repo를 최신 상태로 맞춥니다.

@@ -129,6 +129,28 @@ def test_duplicate_task_selection_is_resolved_as_conflict() -> None:
     assert info["conflicts"] == {"p_1": 0}
 
 
+def test_info_reports_finished_cpu_bursts() -> None:
+    env = SchedulerEnv(
+        core_config={CoreType.P: 1},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=0.5,
+        episode_time=30.0,
+        max_tasks=1,
+        seed=3,
+    )
+
+    observations, _ = env.reset()
+    action = 1 if observations["p_0"]["action_mask"][1] else 0
+    _, rewards, _, _, info = env.step({"p_0": action})
+
+    assert len(info["finished_runs"]) == 1
+    finished = info["finished_runs"][0]
+    assert finished["core_id"] == "p_0"
+    assert finished["pid"] == 0
+    assert finished["run_time"] > 0.0
+    assert rewards["p_0"] == pytest.approx(finished["reward"])
+
+
 def test_episode_time_is_arrival_horizon_not_truncation_time() -> None:
     env = SchedulerEnv(
         core_config={CoreType.LP_E: 1},

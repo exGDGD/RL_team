@@ -25,6 +25,7 @@ class ACACConfig:
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
     learning_rate: float = 3.0e-4
+    allow_noop: bool = False
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,9 @@ class TorchACACPolicy(nn.Module):
                     continue
 
                 tensors = batch_rows_to_tensors(batch, rows, self.device)
+                if not self.config.allow_noop:
+                    tensors["action_mask"] = tensors["action_mask"].clone()
+                    tensors["action_mask"][:, 0] = False
                 logits = self.actors[core_type.value](**tensors)
                 dist = Categorical(logits=logits)
                 sampled_actions = torch.argmax(logits, dim=-1) if deterministic else dist.sample()

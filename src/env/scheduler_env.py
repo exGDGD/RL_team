@@ -142,6 +142,7 @@ class SchedulerEnv:
             "assignments": {},
             "conflicts": {},
             "invalid_actions": {},
+            "finished_runs": [],
         }
 
         self._advance_to_decision()
@@ -182,6 +183,7 @@ class SchedulerEnv:
             "assignments": dict(self._last_step_info["assignments"]),
             "conflicts": dict(self._last_step_info["conflicts"]),
             "invalid_actions": dict(self._last_step_info["invalid_actions"]),
+            "finished_runs": list(self._last_step_info["finished_runs"]),
         }
 
     def metrics(self, starvation_threshold: float = 100.0) -> EpisodeMetrics:
@@ -264,6 +266,7 @@ class SchedulerEnv:
             "assignments": assignments,
             "conflicts": conflicts,
             "invalid_actions": invalid_actions,
+            "finished_runs": [],
         }
 
     def _pop_ready_task(self, pid: int) -> Task | None:
@@ -327,6 +330,16 @@ class SchedulerEnv:
                 starvation_cost=starvation_cost,
             )
             self._last_rewards[core_id] += reward
+            self._last_step_info["finished_runs"].append(
+                {
+                    "core_id": core_id,
+                    "pid": pid,
+                    "time": self.sim.now,
+                    "run_time": run_time,
+                    "reward": reward,
+                    "task_done": task.done,
+                }
+            )
             if task.done:
                 self.completed_tasks.append(task)
             elif io_wait is not None:
