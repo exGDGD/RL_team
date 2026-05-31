@@ -52,6 +52,16 @@ class RolloutBuffer:
     def append(self, transition: AgentTransition) -> None:
         self.transitions.append(transition)
 
+    def extend(self, other: RolloutBuffer) -> None:
+        self.transitions.extend(other.transitions)
+        self.env_steps += other.env_steps
+        self.conflicts += other.conflicts
+        self.invalid_actions += other.invalid_actions
+        self.decisions += other.decisions
+        self.forced_decisions += other.forced_decisions
+        self.total_task_choices += other.total_task_choices
+        self.max_task_choices = max(self.max_task_choices, other.max_task_choices)
+
     @property
     def mean_task_choices(self) -> float:
         if self.decisions == 0:

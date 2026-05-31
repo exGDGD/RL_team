@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from src.env import CoreType, RewardWeights, SchedulerEnv, WorkloadScenario
-from src.rl import collect_episode
+from src.rl import RolloutBuffer, collect_episode
 
 
 def main() -> None:
@@ -18,6 +18,7 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--eval-seed", type=int, default=10_000)
+    parser.add_argument("--rollout-episodes", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--arrival-rate", type=float, default=1.0)
     parser.add_argument("--episode-time", type=float, default=80.0)
@@ -27,6 +28,7 @@ def main() -> None:
     parser.add_argument("--lambda-latency", type=float, default=0.1)
     parser.add_argument("--starvation-max-wait-weight", type=float, default=0.5)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--reward-scale", type=float, default=0.01)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/acac_p2e2"))
     parser.add_argument("--save-every", type=int, default=10)
@@ -50,7 +52,11 @@ def main() -> None:
             ) from exc
         raise
 
-    config = ACACConfig(hidden_dim=args.hidden_dim, allow_noop=False)
+    config = ACACConfig(
+        hidden_dim=args.hidden_dim,
+        allow_noop=False,
+        reward_scale=args.reward_scale,
+    )
     policy = TorchACACPolicy(config, device=args.device)
     trainer = ACACTrainer(policy)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -73,14 +79,27 @@ def main() -> None:
     print(f"logs={metrics_path} latest={latest_path} best={best_path}")
 
     for episode_idx in range(start_episode, args.episodes + 1):
-        env = make_env(args, seed=args.seed + episode_idx)
-        rollout = collect_episode(env, policy, seed=args.seed + episode_idx)
+        rollout = RolloutBuffer()
+        env = None
+        for rollout_offset in range(args.rollout_episodes):
+            rollout_seed = (
+                args.seed
+                + (episode_idx - 1) * args.rollout_episodes
+                + rollout_offset
+                + 1
+            )
+            env = make_env(args, seed=rollout_seed)
+            rollout.extend(collect_episode(env, policy, seed=rollout_seed))
         if len(rollout) == 0:
             print(f"episode={episode_idx} skipped empty rollout")
             continue
 
+        assert env is not None
         stats = trainer.update(rollout)
-        total_reward = sum(transition.reward for transition in rollout.transitions)
+        total_reward = (
+            sum(transition.reward for transition in rollout.transitions)
+            / args.rollout_episodes
+        )
         metrics = env.metrics()
         should_eval = episode_idx == start_episode or episode_idx % args.eval_every == 0
         eval_summary = (
@@ -109,6 +128,7 @@ def main() -> None:
                 "completed={completed}/{total} throughput={throughput:.3f} "
                 "turnaround={turnaround} loss={loss:.3f} value_loss={value_loss:.3f} "
                 "entropy={entropy:.3f} kl={kl:.4f} clip_frac={clip_fraction:.3f} "
+                "actor_grad={actor_grad:.3f} critic_grad={critic_grad:.3f} "
                 "conflicts={conflicts} choices={choices:.2f} forced={forced:.2f} "
                 "eval_reward={eval_reward:.3f} "
                 "eval_completed={eval_completed:.1f} random_reward={random_reward:.3f} "
@@ -125,6 +145,8 @@ def main() -> None:
                     entropy=stats.entropy,
                     kl=stats.approx_kl,
                     clip_fraction=stats.clip_fraction,
+                    actor_grad=stats.actor_grad_norm,
+                    critic_grad=stats.critic_grad_norm,
                     conflicts=rollout.conflicts,
                     choices=rollout.mean_task_choices,
                     forced=rollout.forced_decision_fraction,

@@ -27,6 +27,7 @@ class ACACConfig:
     learning_rate: float = 3.0e-4
     allow_noop: bool = False
     update_epochs: int = 4
+    reward_scale: float = 0.01
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,8 @@ class UpdateStats:
     entropy: float
     approx_kl: float
     clip_fraction: float
+    actor_grad_norm: float
+    critic_grad_norm: float
 
 
 class TorchACACPolicy(nn.Module):
@@ -188,6 +191,7 @@ class ACACTrainer:
                 next_values=next_values.cpu().numpy(),
                 gamma=self.config.gamma,
                 gae_lambda=self.config.gae_lambda,
+                reward_scale=self.config.reward_scale,
             )
 
         old_log_probs = torch.tensor(
@@ -222,7 +226,14 @@ class ACACTrainer:
 
             self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+            actor_grad_norm = nn.utils.clip_grad_norm_(
+                self.policy.actors.parameters(),
+                self.config.max_grad_norm,
+            )
+            critic_grad_norm = nn.utils.clip_grad_norm_(
+                self.policy.critic.parameters(),
+                self.config.max_grad_norm,
+            )
             self.optimizer.step()
 
             with torch.no_grad():
@@ -240,6 +251,8 @@ class ACACTrainer:
                     entropy.item(),
                     approx_kl.item(),
                     clip_fraction.item(),
+                    actor_grad_norm.item(),
+                    critic_grad_norm.item(),
                 )
             )
 
@@ -251,6 +264,8 @@ class ACACTrainer:
             entropy=float(means[3]),
             approx_kl=float(means[4]),
             clip_fraction=float(means[5]),
+            actor_grad_norm=float(means[6]),
+            critic_grad_norm=float(means[7]),
         )
 
 
@@ -261,6 +276,7 @@ def compute_advantages(
     next_values: np.ndarray,
     gamma: float,
     gae_lambda: float,
+    reward_scale: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     advantages = np.zeros(len(transitions), dtype=np.float32)
     returns = np.zeros(len(transitions), dtype=np.float32)
@@ -269,7 +285,10 @@ def compute_advantages(
     for idx, transition in enumerate(transitions):
         by_agent.setdefault(transition.agent_id, []).append(idx)
 
-    rewards = np.array([transition.reward for transition in transitions], dtype=np.float32)
+    rewards = np.array(
+        [transition.reward * reward_scale for transition in transitions],
+        dtype=np.float32,
+    )
     delta_t = np.array([transition.elapsed_time for transition in transitions], dtype=np.float32)
     dones = np.array(
         [transition.terminated or transition.truncated for transition in transitions],
@@ -304,7 +323,7 @@ def batch_rows_to_tensors(
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
     index = np.asarray(rows, dtype=np.int64)
-    return {
+    tensors = {
         "self_features": torch.as_tensor(batch.self_features[index], dtype=torch.float32, device=device),
         "ready_queue": torch.as_tensor(batch.ready_queue[index], dtype=torch.float32, device=device),
         "ready_mask": torch.as_tensor(batch.ready_mask[index], dtype=torch.float32, device=device),
@@ -313,6 +332,36 @@ def batch_rows_to_tensors(
         "system": torch.as_tensor(batch.system[index], dtype=torch.float32, device=device),
         "action_mask": torch.as_tensor(batch.action_mask[index], dtype=torch.bool, device=device),
     }
+    return normalize_observation_tensors(tensors)
+
+
+def normalize_observation_tensors(
+    tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Keep heterogeneous simulator features in a stable range for MLP inputs."""
+
+    tensors = dict(tensors)
+    self_features = tensors["self_features"].clone()
+    self_features[:, 0] = self_features[:, 0] / max(len(CoreType) - 1, 1)
+    self_features[:, 2:] = torch.log1p(self_features[:, 2:])
+    tensors["self_features"] = self_features
+
+    ready_queue = tensors["ready_queue"].clone()
+    ready_queue[:, :, 0:2] = torch.log1p(ready_queue[:, :, 0:2])
+    ready_queue[:, :, 2] = ready_queue[:, :, 2] / 2.0
+    tensors["ready_queue"] = ready_queue
+
+    other_cores = tensors["other_cores"].clone()
+    if other_cores.shape[1] > 0:
+        other_cores[:, :, 0] = other_cores[:, :, 0] / max(len(CoreType) - 1, 1)
+        other_cores[:, :, 2] = torch.log1p(other_cores[:, :, 2])
+    tensors["other_cores"] = other_cores
+
+    system = tensors["system"].clone()
+    system[:, 0] = system[:, 0] / 12.0
+    system[:, 2:] = system[:, 2:] / 12.0
+    tensors["system"] = system
+    return tensors
 
 
 def transition_row_to_tensors(
