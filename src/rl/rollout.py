@@ -11,8 +11,14 @@ from .obs import AgentBatch, build_agent_batch
 class RolloutPolicy(Protocol):
     """Policy interface used by the async rollout collector."""
 
-    def act(self, batch: AgentBatch) -> tuple[dict[str, int], dict[str, float]]:
-        """Return actions and log-probs keyed by agent id."""
+    def act(
+        self,
+        batch: AgentBatch,
+    ) -> (
+        tuple[dict[str, int], dict[str, float]]
+        | tuple[dict[str, int], dict[str, float], dict[str, object]]
+    ):
+        """Return actions, log-probs, and optionally effective action masks."""
 
 
 def collect_episode(
@@ -31,7 +37,8 @@ def collect_episode(
 
     for _ in range(max_env_steps):
         actions = {agent_id: 0 for agent_id in env.agents}
-        chosen_actions, log_probs = policy.act(batch)
+        chosen_actions, log_probs, effective_masks = _unpack_policy_output(policy.act(batch))
+        proposed_agent_ids: set[str] = set()
 
         for agent_id in batch.decision_agent_ids():
             agent_index = batch.agent_ids.index(agent_id)
@@ -41,16 +48,26 @@ def collect_episode(
             if agent_id in pending:
                 raise RuntimeError(f"Agent {agent_id} has an unfinished pending decision.")
             actions[agent_id] = action
+            proposed_agent_ids.add(agent_id)
             pending[agent_id] = PendingDecision(
                 agent_id=agent_id,
                 agent_index=agent_index,
                 obs=batch,
                 action=action,
                 log_prob=float(log_probs.get(agent_id, 0.0)),
+                action_mask=effective_masks.get(agent_id, batch.action_mask[agent_index]).copy(),
                 start_time=float(info["time"]),
             )
 
         next_observations, rewards, terminations, truncations, next_info = env.step(actions)
+        buffer.env_steps += 1
+        buffer.conflicts += len(next_info.get("conflicts", {}))
+        buffer.invalid_actions += len(next_info.get("invalid_actions", {}))
+        _discard_rejected_decisions(
+            pending=pending,
+            proposed_agent_ids=proposed_agent_ids,
+            assigned_agent_ids=set(next_info.get("assignments", {})),
+        )
         next_batch = build_agent_batch(next_observations, agent_order=env.agents)
         terminated = all(terminations.values())
         truncated = all(truncations.values())
@@ -86,6 +103,24 @@ def collect_episode(
     return buffer
 
 
+def _unpack_policy_output(policy_output):
+    if len(policy_output) == 2:
+        actions, log_probs = policy_output
+        return actions, log_probs, {}
+    actions, log_probs, effective_masks = policy_output
+    return actions, log_probs, effective_masks
+
+
+def _discard_rejected_decisions(
+    *,
+    pending: dict[str, PendingDecision],
+    proposed_agent_ids: set[str],
+    assigned_agent_ids: set[str],
+) -> None:
+    for agent_id in proposed_agent_ids - assigned_agent_ids:
+        del pending[agent_id]
+
+
 def _close_finished_decisions(
     *,
     pending: dict[str, PendingDecision],
@@ -111,6 +146,7 @@ def _close_finished_decisions(
                 obs=decision.obs,
                 action=decision.action,
                 log_prob=decision.log_prob,
+                action_mask=decision.action_mask,
                 reward=float(rewards.get(agent_id, 0.0)),
                 next_obs=next_batch,
                 next_agent_index=next_agent_index,

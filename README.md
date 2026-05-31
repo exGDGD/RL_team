@@ -139,6 +139,14 @@ python -m src.train_acac --episodes 100 --eval-every 10
 
 현재 학습 entrypoint는 `P2E2 + balanced workload` 고정 구성으로 시작합니다. `SchedulerEnv`의 NO-OP는 아직 idle duration을 진행시키지 않으므로, 초기 ACAC sanity training에서는 NO-OP sampling을 비활성화합니다.
 
+학습 중 `outputs/acac_p2e2/metrics.jsonl`, `latest.pt`, `best.pt`가 생성됩니다. Colab 런타임 종료 후에도 보존하려면 `--output-dir`에 Google Drive 경로를 넘깁니다. 중단된 학습은 다음처럼 이어서 실행합니다.
+
+```bash
+python -m src.train_acac \
+  --episodes 200 \
+  --resume outputs/acac_p2e2/latest.pt
+```
+
 ## Collaboration Flow
 
 1. 작업 전 repo를 최신 상태로 맞춥니다.

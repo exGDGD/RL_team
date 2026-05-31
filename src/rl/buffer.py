@@ -16,6 +16,7 @@ class PendingDecision:
     obs: AgentBatch
     action: int
     log_prob: float
+    action_mask: np.ndarray
     start_time: float
 
 
@@ -28,6 +29,7 @@ class AgentTransition:
     obs: AgentBatch
     action: int
     log_prob: float
+    action_mask: np.ndarray
     reward: float
     next_obs: AgentBatch
     next_agent_index: int
@@ -39,6 +41,9 @@ class AgentTransition:
 @dataclass
 class RolloutBuffer:
     transitions: list[AgentTransition] = field(default_factory=list)
+    env_steps: int = 0
+    conflicts: int = 0
+    invalid_actions: int = 0
 
     def append(self, transition: AgentTransition) -> None:
         self.transitions.append(transition)

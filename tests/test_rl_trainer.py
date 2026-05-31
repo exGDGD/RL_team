@@ -1,5 +1,7 @@
 import numpy as np
 import pytest
+from argparse import Namespace
+from pathlib import Path
 
 torch = pytest.importorskip("torch")
 
@@ -11,6 +13,7 @@ from src.rl.trainer import (
     TorchACACPolicy,
     compute_advantages,
 )
+from src.train_acac import append_jsonl, save_checkpoint
 
 
 class FirstValidPolicy:
@@ -67,3 +70,29 @@ def test_torch_acac_policy_can_update_from_collected_rollout() -> None:
     assert np.isfinite(stats.loss)
     assert np.isfinite(stats.policy_loss)
     assert np.isfinite(stats.value_loss)
+
+
+def test_checkpoint_and_jsonl_log_can_be_written(tmp_path: Path) -> None:
+    policy = TorchACACPolicy(ACACConfig(hidden_dim=16, critic_heads=4))
+    trainer = ACACTrainer(policy)
+    metrics_path = tmp_path / "metrics.jsonl"
+    checkpoint_path = tmp_path / "latest.pt"
+
+    append_jsonl(metrics_path, {"episode": 1, "reward": 3.5})
+    save_checkpoint(
+        torch=torch,
+        path=checkpoint_path,
+        episode_idx=1,
+        policy=policy,
+        trainer=trainer,
+        config=policy.config,
+        args=Namespace(output_dir=tmp_path, resume=None),
+        best_eval_reward=3.5,
+        eval_summary={"reward": 3.5},
+    )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    assert metrics_path.read_text(encoding="utf-8").endswith("\n")
+    assert checkpoint["episode"] == 1
+    assert checkpoint["best_eval_reward"] == pytest.approx(3.5)
+    assert checkpoint["args"]["output_dir"] == str(tmp_path)

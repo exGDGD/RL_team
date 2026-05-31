@@ -26,6 +26,7 @@ class ACACConfig:
     max_grad_norm: float = 0.5
     learning_rate: float = 3.0e-4
     allow_noop: bool = False
+    update_epochs: int = 4
 
 
 @dataclass(frozen=True)
@@ -67,35 +68,37 @@ class TorchACACPolicy(nn.Module):
         batch: AgentBatch,
         *,
         deterministic: bool = False,
-    ) -> tuple[dict[str, int], dict[str, float]]:
+    ) -> tuple[dict[str, int], dict[str, float], dict[str, np.ndarray]]:
         actions = {agent_id: 0 for agent_id in batch.agent_ids}
         log_probs = {agent_id: 0.0 for agent_id in batch.agent_ids}
+        effective_masks: dict[str, np.ndarray] = {}
+        claimed_slots: set[int] = set()
 
         with torch.no_grad():
-            for core_type in CoreType:
-                rows = [
-                    idx
-                    for idx in batch.indices_for_core_type(core_type).tolist()
-                    if bool(batch.decision_mask[idx])
-                ]
-                if not rows:
+            for row, agent_id in enumerate(batch.agent_ids):
+                if not bool(batch.decision_mask[row]):
                     continue
 
-                tensors = batch_rows_to_tensors(batch, rows, self.device)
-                if not self.config.allow_noop:
-                    tensors["action_mask"] = tensors["action_mask"].clone()
-                    tensors["action_mask"][:, 0] = False
+                core_type = list(CoreType)[int(batch.core_type_indices[row])]
+                tensors = batch_rows_to_tensors(batch, [row], self.device)
+                tensors = self._apply_policy_action_mask(tensors)
+                for claimed_slot in claimed_slots:
+                    tensors["action_mask"][:, claimed_slot] = False
+                if not torch.any(tensors["action_mask"]):
+                    continue
                 logits = self.actors[core_type.value](**tensors)
                 dist = Categorical(logits=logits)
                 sampled_actions = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
                 sampled_log_probs = dist.log_prob(sampled_actions)
 
-                for offset, row in enumerate(rows):
-                    agent_id = batch.agent_ids[row]
-                    actions[agent_id] = int(sampled_actions[offset].item())
-                    log_probs[agent_id] = float(sampled_log_probs[offset].item())
+                action = int(sampled_actions[0].item())
+                actions[agent_id] = action
+                log_probs[agent_id] = float(sampled_log_probs[0].item())
+                effective_masks[agent_id] = tensors["action_mask"][0].cpu().numpy()
+                if action > 0:
+                    claimed_slots.add(action)
 
-        return actions, log_probs
+        return actions, log_probs, effective_masks
 
     def evaluate_transitions(
         self,
@@ -107,6 +110,11 @@ class TorchACACPolicy(nn.Module):
 
         for idx, transition in enumerate(transitions):
             tensors = transition_row_to_tensors(transition, self.device)
+            tensors["action_mask"] = torch.as_tensor(
+                transition.action_mask,
+                dtype=torch.bool,
+                device=self.device,
+            ).unsqueeze(0)
             core_type = list(CoreType)[int(transition.obs.core_type_indices[transition.agent_index])]
             logits = self.actors[core_type.value](**_actor_inputs(tensors))
             dist = Categorical(logits=logits)
@@ -120,6 +128,17 @@ class TorchACACPolicy(nn.Module):
             return empty, empty, empty
 
         return torch.stack(log_probs), torch.stack(entropies), torch.stack(values)
+
+    def _apply_policy_action_mask(
+        self,
+        tensors: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        if self.config.allow_noop:
+            return tensors
+        tensors = dict(tensors)
+        tensors["action_mask"] = tensors["action_mask"].clone()
+        tensors["action_mask"][:, 0] = False
+        return tensors
 
     def values_for_transitions(
         self,
@@ -180,45 +199,58 @@ class ACACTrainer:
         returns_t = torch.tensor(returns, dtype=torch.float32, device=self.policy.device)
         advantages_t = normalize_advantages(advantages_t)
 
-        new_log_probs, entropies, values = self.policy.evaluate_transitions(transitions)
-        ratio = torch.exp(new_log_probs - old_log_probs)
-        clipped_ratio = torch.clamp(
-            ratio,
-            1.0 - self.config.clip_ratio,
-            1.0 + self.config.clip_ratio,
-        )
-        policy_loss = -torch.min(
-            ratio * advantages_t,
-            clipped_ratio * advantages_t,
-        ).mean()
-        value_loss = 0.5 * torch.mean((returns_t - values) ** 2)
-        entropy = entropies.mean()
-        loss = (
-            policy_loss
-            + self.config.value_coef * value_loss
-            - self.config.entropy_coef * entropy
-        )
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
-        self.optimizer.step()
-
-        with torch.no_grad():
-            approx_kl = (old_log_probs - new_log_probs).mean()
-            clip_fraction = (
-                (torch.abs(ratio - 1.0) > self.config.clip_ratio)
-                .float()
-                .mean()
+        epoch_stats = []
+        for _ in range(self.config.update_epochs):
+            new_log_probs, entropies, values = self.policy.evaluate_transitions(transitions)
+            ratio = torch.exp(new_log_probs - old_log_probs)
+            clipped_ratio = torch.clamp(
+                ratio,
+                1.0 - self.config.clip_ratio,
+                1.0 + self.config.clip_ratio,
+            )
+            policy_loss = -torch.min(
+                ratio * advantages_t,
+                clipped_ratio * advantages_t,
+            ).mean()
+            value_loss = 0.5 * torch.mean((returns_t - values) ** 2)
+            entropy = entropies.mean()
+            loss = (
+                policy_loss
+                + self.config.value_coef * value_loss
+                - self.config.entropy_coef * entropy
             )
 
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+            self.optimizer.step()
+
+            with torch.no_grad():
+                approx_kl = (old_log_probs - new_log_probs).mean()
+                clip_fraction = (
+                    (torch.abs(ratio - 1.0) > self.config.clip_ratio)
+                    .float()
+                    .mean()
+                )
+            epoch_stats.append(
+                (
+                    loss.item(),
+                    policy_loss.item(),
+                    value_loss.item(),
+                    entropy.item(),
+                    approx_kl.item(),
+                    clip_fraction.item(),
+                )
+            )
+
+        means = np.mean(epoch_stats, axis=0)
         return UpdateStats(
-            loss=float(loss.item()),
-            policy_loss=float(policy_loss.item()),
-            value_loss=float(value_loss.item()),
-            entropy=float(entropy.item()),
-            approx_kl=float(approx_kl.item()),
-            clip_fraction=float(clip_fraction.item()),
+            loss=float(means[0]),
+            policy_loss=float(means[1]),
+            value_loss=float(means[2]),
+            entropy=float(means[3]),
+            approx_kl=float(means[4]),
+            clip_fraction=float(means[5]),
         )
 
 

@@ -1,5 +1,6 @@
 from src.env import CoreType, SchedulerEnv, WorkloadScenario
 from src.rl import AgentBatch, collect_episode
+from src.rl.rollout import _discard_rejected_decisions
 
 
 class FirstValidPolicy:
@@ -52,3 +53,15 @@ def test_collect_episode_does_not_store_noop_as_pending_macro_action() -> None:
     buffer = collect_episode(env, NoOpPolicy(), seed=3, max_env_steps=3)
 
     assert len(buffer) == 0
+
+
+def test_rejected_conflict_decision_is_removed_from_pending() -> None:
+    pending = {"p_0": object(), "p_1": object()}
+
+    _discard_rejected_decisions(
+        pending=pending,
+        proposed_agent_ids={"p_0", "p_1"},
+        assigned_agent_ids={"p_0"},
+    )
+
+    assert set(pending) == {"p_0"}
