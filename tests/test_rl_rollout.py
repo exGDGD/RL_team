@@ -1,6 +1,7 @@
 from src.env import CoreType, SchedulerEnv, WorkloadScenario
 from src.rl import AgentBatch, RolloutBuffer, collect_episode
 from src.rl.rollout import _discard_rejected_decisions
+from src.train_acac import summarize_rollout_actions
 
 
 class FirstValidPolicy:
@@ -85,3 +86,22 @@ def test_combined_rollouts_receive_distinct_episode_ids() -> None:
 
     assert combined.episodes == 2
     assert {transition.episode_id for transition in combined.transitions} == {0, 1}
+
+
+def test_rollout_action_summary_describes_selected_task_features() -> None:
+    env = SchedulerEnv(
+        core_config={CoreType.P: 1},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=0.5,
+        episode_time=30.0,
+        max_tasks=4,
+        seed=3,
+    )
+
+    summary = summarize_rollout_actions(collect_episode(env, FirstValidPolicy(), seed=3))
+
+    assert summary["mean_queue_slot"] == 1.0
+    assert summary["first_slot_fraction"] == 1.0
+    assert summary["mean_selected_wait"] >= 0.0
+    assert 0.0 <= summary["mean_selected_latency"] <= 2.0
+    assert 0.0 <= summary["mean_selected_cpu_intensity"] <= 1.0

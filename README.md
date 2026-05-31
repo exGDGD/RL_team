@@ -161,6 +161,8 @@ python -m src.train_acac \
 
 학습 중 `outputs/acac_p2e2/metrics.jsonl`, `latest.pt`, `best.pt`가 생성됩니다. Colab 런타임 종료 후에도 보존하려면 `--output-dir`에 Google Drive 경로를 넘깁니다. 중단된 학습은 다음처럼 이어서 실행합니다.
 
+콘솔의 `eval_reward`는 argmax action을 쓰는 deterministic 평가이고, `sampled_eval_reward`는 현재 확률 정책에서 action을 sampling한 평가입니다. 학습 초반에는 entropy가 높으므로 random baseline과 비교할 때 `sampled_eval_reward`도 함께 확인합니다. `metrics.jsonl`에는 queue slot과 선택된 task 특성 요약도 기록됩니다.
+
 ```bash
 python -m src.train_acac \
   --episodes 200 \

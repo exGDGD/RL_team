@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -135,7 +136,8 @@ def main() -> None:
                 "actor_grad={actor_grad:.3f} critic_grad={critic_grad:.3f} "
                 "adv_std={adv_std:.3f} "
                 "conflicts={conflicts} choices={choices:.2f} forced={forced:.2f} "
-                "eval_reward={eval_reward:.3f} "
+                "eval_reward={eval_reward:.3f} sampled_eval_reward={sampled_eval_reward:.3f} "
+                "eval_first={eval_first:.2f} sampled_first={sampled_first:.2f} "
                 "eval_completed={eval_completed:.1f} random_reward={random_reward:.3f} "
                 "sjf_reward={sjf_reward:.3f} eas_reward={eas_reward:.3f}".format(
                     episode=episode_idx,
@@ -157,6 +159,9 @@ def main() -> None:
                     choices=rollout.mean_task_choices,
                     forced=rollout.forced_decision_fraction,
                     eval_reward=eval_summary["reward"],
+                    sampled_eval_reward=eval_summary["sampled"]["reward"],
+                    eval_first=eval_summary["actions"]["first_slot_fraction"],
+                    sampled_first=eval_summary["sampled"]["actions"]["first_slot_fraction"],
                     eval_completed=eval_summary["completed"],
                     random_reward=eval_summary["baselines"]["random"]["reward"],
                     sjf_reward=eval_summary["baselines"]["sjf_like"]["reward"],
@@ -219,29 +224,58 @@ def evaluate_policy(
     base_seed: int,
     episodes: int = 5,
 ) -> dict[str, Any]:
+    summary = evaluate_rl_policy(
+        policy,
+        args,
+        base_seed=base_seed,
+        episodes=episodes,
+        deterministic=True,
+    )
+    summary["sampled"] = evaluate_rl_policy(
+        policy,
+        args,
+        base_seed=base_seed,
+        episodes=episodes,
+        deterministic=False,
+    )
+    summary["baselines"] = evaluate_baselines(args, base_seed=base_seed, episodes=episodes)
+    return summary
+
+
+def evaluate_rl_policy(
+    policy,
+    args: argparse.Namespace,
+    *,
+    base_seed: int,
+    episodes: int,
+    deterministic: bool,
+) -> dict[str, Any]:
     rewards = []
     completed = []
     throughputs = []
     diagnostics = []
-    for offset in range(episodes):
-        env = make_env(args, seed=base_seed + offset)
-        rollout = collect_episode(
-            env,
-            DeterministicPolicy(policy),
-            seed=base_seed + offset,
-        )
-        rewards.append(sum(transition.reward for transition in rollout.transitions))
-        metrics = env.metrics()
-        completed.append(metrics.completed_tasks)
-        throughputs.append(metrics.throughput)
-        diagnostics.append(env.reward_diagnostics())
+    action_summaries = []
+    with preserve_torch_rng(seed=base_seed, enabled=not deterministic):
+        for offset in range(episodes):
+            env = make_env(args, seed=base_seed + offset)
+            rollout = collect_episode(
+                env,
+                EvaluationPolicy(policy, deterministic=deterministic),
+                seed=base_seed + offset,
+            )
+            rewards.append(sum(transition.reward for transition in rollout.transitions))
+            metrics = env.metrics()
+            completed.append(metrics.completed_tasks)
+            throughputs.append(metrics.throughput)
+            diagnostics.append(env.reward_diagnostics())
+            action_summaries.append(summarize_rollout_actions(rollout))
 
     return {
         "reward": float(np.mean(rewards)),
         "completed": float(np.mean(completed)),
         "throughput": float(np.mean(throughputs)),
         "reward_diagnostics": mean_dict(diagnostics),
-        "baselines": evaluate_baselines(args, base_seed=base_seed, episodes=episodes),
+        "actions": mean_dict(action_summaries),
     }
 
 
@@ -289,6 +323,58 @@ def mean_dict(rows: list[dict[str, float]]) -> dict[str, float]:
     }
 
 
+def summarize_rollout_actions(rollout: RolloutBuffer) -> dict[str, float]:
+    if not rollout.transitions:
+        return {
+            "mean_queue_slot": 0.0,
+            "first_slot_fraction": 0.0,
+            "mean_selected_wait": 0.0,
+            "mean_selected_progress": 0.0,
+            "mean_selected_latency": 0.0,
+            "mean_selected_cpu_intensity": 0.0,
+        }
+
+    actions = np.asarray([transition.action for transition in rollout.transitions])
+    selected_tasks = np.stack(
+        [
+            transition.obs.ready_queue[
+                transition.agent_index,
+                transition.action - 1,
+            ]
+            for transition in rollout.transitions
+        ]
+    )
+    return {
+        "mean_queue_slot": float(np.mean(actions)),
+        "first_slot_fraction": float(np.mean(actions == 1)),
+        "mean_selected_wait": float(np.mean(selected_tasks[:, 0])),
+        "mean_selected_progress": float(np.mean(selected_tasks[:, 1])),
+        "mean_selected_latency": float(np.mean(selected_tasks[:, 2])),
+        "mean_selected_cpu_intensity": float(np.mean(selected_tasks[:, 3])),
+    }
+
+
+@contextmanager
+def preserve_torch_rng(*, seed: int, enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    import torch
+
+    cpu_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        yield
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
 def build_log_row(
     *,
     episode_idx: int,
@@ -311,6 +397,7 @@ def build_log_row(
         "forced_decision_fraction": rollout.forced_decision_fraction,
         "reward": total_reward,
         "mean_elapsed_time": float(np.mean(elapsed_times)),
+        "actions": summarize_rollout_actions(rollout),
         "metrics": metrics.as_dict(),
         "update": asdict(stats),
         "evaluation": eval_summary,
@@ -356,12 +443,13 @@ def serialize_args(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-class DeterministicPolicy:
-    def __init__(self, policy) -> None:
+class EvaluationPolicy:
+    def __init__(self, policy, *, deterministic: bool) -> None:
         self.policy = policy
+        self.deterministic = deterministic
 
     def act(self, batch):
-        return self.policy.act(batch, deterministic=True)
+        return self.policy.act(batch, deterministic=self.deterministic)
 
 
 def _fmt(value: float | None) -> str:
