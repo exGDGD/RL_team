@@ -24,6 +24,9 @@ def main() -> None:
     parser.add_argument("--arrival-rate", type=float, default=1.0)
     parser.add_argument("--episode-time", type=float, default=80.0)
     parser.add_argument("--max-tasks", type=int, default=64)
+    parser.add_argument("--progress-work", type=float, default=0.0)
+    parser.add_argument("--completion", type=float, default=0.0)
+    parser.add_argument("--completion-work", type=float, default=0.0)
     parser.add_argument("--lambda-energy", type=float, default=0.1)
     parser.add_argument("--lambda-starvation", type=float, default=0.05)
     parser.add_argument("--lambda-latency", type=float, default=0.5)
@@ -210,6 +213,9 @@ def make_env(args: argparse.Namespace, *, seed: int) -> SchedulerEnv:
 
 def reward_weights_from_args(args: argparse.Namespace) -> RewardWeights:
     return RewardWeights(
+        progress_work=getattr(args, "progress_work", 0.0),
+        completion=getattr(args, "completion", 0.0),
+        completion_work=getattr(args, "completion_work", 0.0),
         energy=getattr(args, "lambda_energy", 0.1),
         starvation=getattr(args, "lambda_starvation", 0.05),
         latency=getattr(args, "lambda_latency", 0.5),

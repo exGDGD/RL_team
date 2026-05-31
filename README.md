@@ -149,10 +149,13 @@ python -m src.train_acac \
   --critic-learning-rate 0.0003
 ```
 
-Energy와 latency cost는 물리적으로 해석 가능한 raw 값을 유지하고 lambda로 trade-off를 조정합니다. Starvation cost는 queue 길이와 긴 대기시간 때문에 폭발하지 않도록 `mean(log1p(wait)) + beta * max(log1p(wait))`에 burst 실행 시간을 곱합니다. 초기 sanity training은 정책 차이가 충분히 보이도록 `energy=0.1`, `starvation=0.05`, `latency=0.5`, `beta=0.5`를 사용합니다.
+Energy와 latency cost는 물리적으로 해석 가능한 raw 값을 유지하고 lambda로 trade-off를 조정합니다. Starvation cost는 queue 길이와 긴 대기시간 때문에 폭발하지 않도록 `mean(log1p(wait)) + beta * max(log1p(wait))`에 burst 실행 시간을 곱합니다. 초기 sanity training은 모든 task가 완료되는 trace를 사용하므로 episode 합에서 거의 상수인 progress/completion shaping은 끕니다. 정책 차이가 충분히 보이도록 `progress=0.0`, `completion=0.0`, `completion_work=0.0`, `energy=0.1`, `starvation=0.05`, `latency=0.5`, `beta=0.5`를 사용합니다. Cost-only reward는 0에 가까울수록 좋습니다.
 
 ```bash
 python -m src.train_acac \
+  --progress-work 0.0 \
+  --completion 0.0 \
+  --completion-work 0.0 \
   --lambda-energy 0.1 \
   --lambda-starvation 0.05 \
   --lambda-latency 0.5 \
