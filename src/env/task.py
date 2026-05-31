@@ -49,6 +49,10 @@ class Task:
         return self.cpu_bursts[self.current_burst_idx]
 
     @property
+    def remaining_cpu_work(self) -> float:
+        return sum(self.cpu_bursts[self.current_burst_idx :])
+
+    @property
     def has_next_io(self) -> bool:
         return self.current_burst_idx < len(self.io_waits)
 

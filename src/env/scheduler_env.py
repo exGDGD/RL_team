@@ -443,7 +443,7 @@ class SchedulerEnv:
     def _observe_agent(self, agent_id: str) -> dict[str, Any]:
         core = self.cores[agent_id]
         now = self.sim.now
-        ready_features = np.zeros((self.queue_size, 4), dtype=np.float32)
+        ready_features = np.zeros((self.queue_size, 6), dtype=np.float32)
         ready_mask = np.zeros((self.queue_size,), dtype=np.int8)
         for idx, task in enumerate(self.ready_queue[: self.queue_size]):
             ready_features[idx] = np.array(
@@ -452,6 +452,8 @@ class SchedulerEnv:
                     task.cpu_progress,
                     float(task.latency_class),
                     task.cpu_intensity,
+                    task.current_cpu_burst,
+                    task.remaining_cpu_work,
                 ],
                 dtype=np.float32,
             )

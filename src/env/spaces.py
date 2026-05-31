@@ -7,7 +7,7 @@ from .core import CoreType
 
 
 SELF_FEATURE_DIM = 5
-READY_TASK_FEATURE_DIM = 4
+READY_TASK_FEATURE_DIM = 6
 OTHER_CORE_FEATURE_DIM = 3
 SYSTEM_FEATURE_DIM = 2 + len(CoreType)
 
@@ -37,7 +37,10 @@ def build_observation_space(
             "ready_queue": spaces.Box(
                 low=np.zeros((queue_size, READY_TASK_FEATURE_DIM), dtype=np.float32),
                 high=np.tile(
-                    np.array([np.inf, np.inf, 2.0, 1.0], dtype=np.float32),
+                    np.array(
+                        [np.inf, np.inf, 2.0, 1.0, np.inf, np.inf],
+                        dtype=np.float32,
+                    ),
                     (queue_size, 1),
                 ),
                 dtype=np.float32,

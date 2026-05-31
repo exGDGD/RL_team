@@ -22,7 +22,7 @@ def test_build_agent_batch_preserves_agent_order_and_shapes() -> None:
     assert batch.num_agents == 2
     assert batch.queue_size == env.queue_size
     assert batch.self_features.shape == (2, 5)
-    assert batch.ready_queue.shape == (2, env.queue_size, 4)
+    assert batch.ready_queue.shape == (2, env.queue_size, 6)
     assert batch.ready_mask.shape == (2, env.queue_size)
     assert batch.other_cores.shape == (2, 1, 3)
     assert batch.other_core_mask.shape == (2, 1)

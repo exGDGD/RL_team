@@ -27,7 +27,7 @@ def test_reset_returns_observations_for_all_cores() -> None:
     assert info["time"] >= 0.0
     for obs in observations.values():
         assert obs["self"].shape == (5,)
-        assert obs["ready_queue"].shape == (8, 4)
+        assert obs["ready_queue"].shape == (8, 6)
         assert obs["ready_mask"].shape == (8,)
         assert obs["action_mask"].shape == (9,)
 

@@ -13,6 +13,9 @@ from src.env import CoreType, RewardWeights, SchedulerEnv, WorkloadScenario
 from src.rl import RolloutBuffer, collect_episode
 
 
+CHECKPOINT_VERSION = "learnable_actor_filter_v1"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Single-config ACAC sanity training.")
     parser.add_argument("--episodes", type=int, default=100)
@@ -39,6 +42,12 @@ def main() -> None:
     parser.add_argument("--entropy-coef", type=float, default=0.0)
     parser.add_argument("--update-epochs", type=int, default=2)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--pretrained-actors",
+        type=Path,
+        default=None,
+        help="Optional SJF imitation checkpoint used to initialize actor weights.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/acac_p2e2"))
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument(
@@ -72,6 +81,14 @@ def main() -> None:
         update_epochs=args.update_epochs,
     )
     policy = TorchACACPolicy(config, device=args.device)
+    if args.pretrained_actors is not None:
+        checkpoint = torch.load(
+            args.pretrained_actors,
+            map_location=policy.device,
+            weights_only=False,
+        )
+        policy.actors.load_state_dict(checkpoint["actors_state_dict"])
+        print(f"loaded pretrained actors={args.pretrained_actors}")
     trainer = ACACTrainer(policy)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "metrics.jsonl"
@@ -82,6 +99,7 @@ def main() -> None:
 
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=policy.device, weights_only=False)
+        validate_checkpoint_version(checkpoint)
         policy.load_state_dict(checkpoint["model_state_dict"])
         trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_episode = int(checkpoint["episode"]) + 1
@@ -142,10 +160,14 @@ def main() -> None:
 
         if eval_summary is not None:
             print(
-                "episode={episode} transitions={transitions} joints={joints} reward={reward:.3f} "
+                "episode={episode} transitions={transitions} actor_samples={actor_samples} "
+                "joints={joints} reward={reward:.3f} "
                 "completed={completed}/{total} throughput={throughput:.3f} "
-                "turnaround={turnaround} loss={loss:.3f} value_loss={value_loss:.3f} "
-                "entropy={entropy:.3f} kl={kl:.4f} clip_frac={clip_fraction:.3f} "
+                "turnaround={turnaround} loss={loss:.3f} policy_loss={policy_loss:.4f} "
+                "value_loss={value_loss:.3f} entropy={entropy:.3f} "
+                "norm_entropy={norm_entropy:.3f} kl={kl:.4f} "
+                "ratio_std={ratio_std:.4f} ratio_max={ratio_max:.4f} "
+                "clip_frac={clip_fraction:.3f} "
                 "actor_grad={actor_grad:.3f} critic_grad={critic_grad:.3f} "
                 "adv_std={adv_std:.3f} "
                 "conflicts={conflicts} choices={choices:.2f} forced={forced:.2f} "
@@ -155,6 +177,7 @@ def main() -> None:
                 "sjf_reward={sjf_reward:.3f} eas_reward={eas_reward:.3f}".format(
                     episode=episode_idx,
                     transitions=len(rollout),
+                    actor_samples=stats.actor_samples,
                     joints=len(rollout.joint_transitions),
                     reward=total_reward,
                     completed=metrics.completed_tasks,
@@ -162,9 +185,13 @@ def main() -> None:
                     throughput=metrics.throughput,
                     turnaround=_fmt(metrics.mean_turnaround_time),
                     loss=stats.loss,
+                    policy_loss=stats.policy_loss,
                     value_loss=stats.value_loss,
                     entropy=stats.entropy,
+                    norm_entropy=stats.normalized_entropy,
                     kl=stats.approx_kl,
+                    ratio_std=stats.ratio_std,
+                    ratio_max=stats.ratio_max_deviation,
                     clip_fraction=stats.clip_fraction,
                     actor_grad=stats.actor_grad_norm,
                     critic_grad=stats.critic_grad_norm,
@@ -350,6 +377,8 @@ def summarize_rollout_actions(rollout: RolloutBuffer) -> dict[str, float]:
             "mean_selected_progress": 0.0,
             "mean_selected_latency": 0.0,
             "mean_selected_cpu_intensity": 0.0,
+            "mean_selected_current_burst": 0.0,
+            "mean_selected_remaining_work": 0.0,
         }
 
     actions = np.asarray([transition.action for transition in rollout.transitions])
@@ -369,6 +398,8 @@ def summarize_rollout_actions(rollout: RolloutBuffer) -> dict[str, float]:
         "mean_selected_progress": float(np.mean(selected_tasks[:, 1])),
         "mean_selected_latency": float(np.mean(selected_tasks[:, 2])),
         "mean_selected_cpu_intensity": float(np.mean(selected_tasks[:, 3])),
+        "mean_selected_current_burst": float(np.mean(selected_tasks[:, 4])),
+        "mean_selected_remaining_work": float(np.mean(selected_tasks[:, 5])),
     }
 
 
@@ -445,6 +476,7 @@ def save_checkpoint(
     eval_summary: dict[str, float] | None,
 ) -> None:
     checkpoint = {
+        "checkpoint_version": CHECKPOINT_VERSION,
         "episode": episode_idx,
         "model_state_dict": policy.state_dict(),
         "optimizer_state_dict": trainer.optimizer.state_dict(),
@@ -457,6 +489,16 @@ def save_checkpoint(
     torch.save(checkpoint, temp_path)
     temp_path.replace(path)
     print(f"saved checkpoint={path} episode={episode_idx}")
+
+
+def validate_checkpoint_version(checkpoint: dict[str, Any]) -> None:
+    checkpoint_version = checkpoint.get("checkpoint_version")
+    if checkpoint_version != CHECKPOINT_VERSION:
+        raise SystemExit(
+            "Checkpoint version mismatch: "
+            f"expected {CHECKPOINT_VERSION!r}, got {checkpoint_version!r}. "
+            "Start a fresh output directory after changing the training algorithm."
+        )
 
 
 def serialize_args(args: argparse.Namespace) -> dict[str, Any]:

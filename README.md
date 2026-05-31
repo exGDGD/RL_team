@@ -91,7 +91,7 @@ tests/
 `SchedulerEnv.observation_space(agent_id)`는 다음 key를 가진 `gymnasium.spaces.Dict`입니다.
 
 - `self`: `(5,)` core type, busy flag, current task elapsed time, accumulated energy, time since last decision
-- `ready_queue`: `(queue_size, 4)` waiting time, CPU progress, latency class, CPU intensity
+- `ready_queue`: `(queue_size, 6)` waiting time, CPU progress, latency class, CPU intensity, current CPU burst, remaining CPU work
 - `ready_mask`: `(queue_size,)`
 - `other_cores`: `(num_cores - 1, 3)` core type, busy flag, current task elapsed time
 - `system`: `(6,)` total core count, utilization, 4-way core type counts
@@ -139,9 +139,26 @@ python -m src.train_acac --episodes 100 --eval-every 10
 
 현재 학습 entrypoint는 `P2E2 + balanced workload` 고정 구성으로 시작합니다. 기본 arrival rate는 `1.0`, 최대 task 수는 `64`입니다. 너무 한산한 workload에서는 대부분의 decision에 선택 가능한 task가 하나뿐이라 정책을 학습할 수 없습니다. 출력의 `choices`와 `forced`를 함께 확인합니다. `SchedulerEnv`의 NO-OP는 아직 idle duration을 진행시키지 않으므로, 초기 ACAC sanity training에서는 NO-OP sampling을 비활성화합니다.
 
-학습 update 한 번에는 기본적으로 16개 episode rollout을 합칩니다. ACAC critic은 누군가 새 scheduling decision을 만드는 시점을 shared joint macro-timestep으로 사용합니다. 각 joint interval 내부의 system-wide team reward는 simulated elapsed time에 따라 할인하고 agent 수로 평균냅니다. Joint timeline에서 GAE를 한 번 계산한 뒤, 각 actor action은 자신이 시작된 joint macro-timestep의 advantage를 사용합니다. 콘솔과 평가의 reward는 학습용 평균 reward가 아니라 환경이 실제로 방출한 episode 총점입니다. critic target은 raw 평가 reward와 분리하여 `reward_scale=0.01`을 적용하고, actor와 critic gradient clipping도 별도로 수행합니다. 입력 observation의 대기시간, 진행시간, 누적 에너지는 MLP에 넣기 전에 `log1p`로 안정화합니다.
+학습 update 한 번에는 기본적으로 16개 episode rollout을 합칩니다. ACAC critic은 누군가 새 scheduling decision을 만드는 시점을 shared joint macro-timestep으로 사용합니다. 각 joint interval 내부의 system-wide team reward는 simulated elapsed time에 따라 할인하고 agent 수로 평균냅니다. Joint timeline에서 GAE를 한 번 계산한 뒤, 각 actor action은 자신이 시작된 joint macro-timestep의 advantage를 사용합니다. 선택 가능한 task가 하나뿐인 forced transition은 critic timeline에는 남기되 actor update에서는 제외합니다. 콘솔과 평가의 reward는 학습용 평균 reward가 아니라 환경이 실제로 방출한 episode 총점입니다. critic target은 raw 평가 reward와 분리하여 `reward_scale=0.01`을 적용하고, actor와 critic gradient clipping도 별도로 수행합니다. 입력 observation의 대기시간, 진행시간, 누적 에너지는 MLP에 넣기 전에 `log1p`로 안정화합니다.
 
 현재 구현은 joint macro-timeline GAE까지 반영한 단계입니다. 공식 ACAC의 GRU history encoder, time embedding, PopArt value normalization, target critic은 이후 단계에서 추가합니다.
+
+PPO를 조정하기 전에 actor 표현력과 action-mask 경로를 분리해서 확인하려면 SJF imitation sanity test를 실행합니다. 이 학습은 ready queue의 current CPU burst를 직접 관측하고 SJF label을 지도학습합니다.
+
+```bash
+python -m src.train_sjf_imitation \
+  --device cuda \
+  --output outputs/sjf_imitation/actors.pt
+```
+
+저장된 actor를 PPO 초기값으로 사용할 수도 있습니다.
+
+```bash
+python -m src.train_acac \
+  --device cuda \
+  --pretrained-actors outputs/sjf_imitation/actors.pt \
+  --output-dir outputs/acac_sjf_warm_start
+```
 
 ```bash
 python -m src.train_acac \

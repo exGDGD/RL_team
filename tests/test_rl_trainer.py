@@ -15,7 +15,7 @@ from src.rl.trainer import (
     compute_joint_advantages,
     map_actor_advantages,
 )
-from src.train_acac import append_jsonl, save_checkpoint
+from src.train_acac import CHECKPOINT_VERSION, append_jsonl, save_checkpoint
 
 
 class FirstValidPolicy:
@@ -56,11 +56,11 @@ def test_compute_advantages_groups_transitions_by_episode() -> None:
 
 def test_torch_acac_policy_can_update_from_collected_rollout() -> None:
     env = SchedulerEnv(
-        core_config={CoreType.P: 1, CoreType.E: 1},
+        core_config={CoreType.P: 1},
         workload_scenario=WorkloadScenario.BALANCED,
-        arrival_rate=0.5,
+        arrival_rate=2.0,
         episode_time=30.0,
-        max_tasks=4,
+        max_tasks=16,
         seed=3,
     )
     rollout = collect_episode(env, FirstValidPolicy(), seed=3)
@@ -72,6 +72,11 @@ def test_torch_acac_policy_can_update_from_collected_rollout() -> None:
     assert np.isfinite(stats.loss)
     assert np.isfinite(stats.policy_loss)
     assert np.isfinite(stats.value_loss)
+    assert stats.actor_samples > 0
+    assert stats.actor_samples == sum(
+        np.count_nonzero(transition.action_mask) > 1
+        for transition in rollout.transitions
+    )
 
 
 def test_compute_advantages_does_not_cross_episode_boundaries() -> None:
@@ -145,5 +150,6 @@ def test_checkpoint_and_jsonl_log_can_be_written(tmp_path: Path) -> None:
 
     assert metrics_path.read_text(encoding="utf-8").endswith("\n")
     assert checkpoint["episode"] == 1
+    assert checkpoint["checkpoint_version"] == CHECKPOINT_VERSION
     assert checkpoint["best_eval_reward"] == pytest.approx(3.5)
     assert checkpoint["args"]["output_dir"] == str(tmp_path)

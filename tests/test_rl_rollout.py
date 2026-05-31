@@ -180,3 +180,5 @@ def test_rollout_action_summary_describes_selected_task_features() -> None:
     assert summary["mean_selected_wait"] >= 0.0
     assert 0.0 <= summary["mean_selected_latency"] <= 2.0
     assert 0.0 <= summary["mean_selected_cpu_intensity"] <= 1.0
+    assert summary["mean_selected_current_burst"] > 0.0
+    assert summary["mean_selected_remaining_work"] > 0.0

@@ -38,6 +38,7 @@ class ACACConfig:
 
 @dataclass(frozen=True)
 class UpdateStats:
+    actor_samples: int
     loss: float
     policy_loss: float
     value_loss: float
@@ -49,6 +50,9 @@ class UpdateStats:
     advantage_mean: float
     advantage_std: float
     return_mean: float
+    normalized_entropy: float
+    ratio_std: float
+    ratio_max_deviation: float
 
 
 class TorchACACPolicy(nn.Module):
@@ -139,6 +143,22 @@ class TorchACACPolicy(nn.Module):
 
         return torch.stack(log_probs), torch.stack(entropies)
 
+    def imitation_logits(
+        self,
+        *,
+        batch: AgentBatch,
+        agent_index: int,
+        action_mask: np.ndarray,
+    ) -> torch.Tensor:
+        tensors = batch_rows_to_tensors(batch, [agent_index], self.device)
+        tensors["action_mask"] = torch.as_tensor(
+            action_mask,
+            dtype=torch.bool,
+            device=self.device,
+        ).unsqueeze(0)
+        core_type = list(CoreType)[int(batch.core_type_indices[agent_index])]
+        return self.actors[core_type.value](**_actor_inputs(tensors)).squeeze(0)
+
     def _apply_policy_action_mask(
         self,
         tensors: dict[str, torch.Tensor],
@@ -211,9 +231,16 @@ class ACACTrainer:
 
     def update(self, rollout: RolloutBuffer) -> UpdateStats:
         transitions = rollout.transitions
+        actor_transitions = [
+            transition
+            for transition in transitions
+            if np.count_nonzero(transition.action_mask) > 1
+        ]
         joint_transitions = rollout.joint_transitions
         if not transitions or not joint_transitions:
             raise ValueError("Cannot update from an empty rollout buffer.")
+        if not actor_transitions:
+            raise ValueError("Rollout has no learnable actor transitions.")
 
         with torch.no_grad():
             old_values = self.policy.values_for_joint_transitions(joint_transitions)
@@ -230,12 +257,12 @@ class ACACTrainer:
                 reward_scale=self.config.reward_scale,
             )
             advantages = map_actor_advantages(
-                transitions=transitions,
+                transitions=actor_transitions,
                 joint_advantages=joint_advantages,
             )
 
         old_log_probs = torch.tensor(
-            [transition.log_prob for transition in transitions],
+            [transition.log_prob for transition in actor_transitions],
             dtype=torch.float32,
             device=self.policy.device,
         )
@@ -245,7 +272,7 @@ class ACACTrainer:
 
         epoch_stats = []
         for _ in range(self.config.update_epochs):
-            new_log_probs, entropies = self.policy.evaluate_transitions(transitions)
+            new_log_probs, entropies = self.policy.evaluate_transitions(actor_transitions)
             values = self.policy.evaluate_joint_transitions(joint_transitions)
             ratio = torch.exp(new_log_probs - old_log_probs)
             clipped_ratio = torch.clamp(
@@ -259,6 +286,10 @@ class ACACTrainer:
             ).mean()
             value_loss = 0.5 * torch.mean((returns_t - values) ** 2)
             entropy = entropies.mean()
+            normalized_entropy = normalize_entropy(
+                entropies=entropies,
+                transitions=actor_transitions,
+            )
             loss = (
                 policy_loss
                 + self.config.value_coef * value_loss
@@ -294,11 +325,15 @@ class ACACTrainer:
                     clip_fraction.item(),
                     actor_grad_norm.item(),
                     critic_grad_norm.item(),
+                    normalized_entropy.item(),
+                    ratio.std(unbiased=False).item(),
+                    torch.max(torch.abs(ratio - 1.0)).item(),
                 )
             )
 
         means = np.mean(epoch_stats, axis=0)
         return UpdateStats(
+            actor_samples=len(actor_transitions),
             loss=float(means[0]),
             policy_loss=float(means[1]),
             value_loss=float(means[2]),
@@ -310,6 +345,9 @@ class ACACTrainer:
             advantage_mean=float(np.mean(advantages)),
             advantage_std=float(np.std(advantages)),
             return_mean=float(np.mean(joint_returns)),
+            normalized_entropy=float(means[8]),
+            ratio_std=float(means[9]),
+            ratio_max_deviation=float(means[10]),
         )
 
 
@@ -372,6 +410,23 @@ def normalize_advantages(advantages: torch.Tensor, eps: float = 1.0e-8) -> torch
     return (advantages - advantages.mean()) / (advantages.std(unbiased=False) + eps)
 
 
+def normalize_entropy(
+    *,
+    entropies: torch.Tensor,
+    transitions: list[AgentTransition],
+) -> torch.Tensor:
+    valid_counts = torch.tensor(
+        [np.count_nonzero(transition.action_mask) for transition in transitions],
+        dtype=entropies.dtype,
+        device=entropies.device,
+    )
+    max_entropies = torch.log(valid_counts)
+    learnable = max_entropies > 0.0
+    if not torch.any(learnable):
+        return torch.zeros((), dtype=entropies.dtype, device=entropies.device)
+    return torch.mean(entropies[learnable] / max_entropies[learnable])
+
+
 def batch_rows_to_tensors(
     batch: AgentBatch,
     rows: list[int],
@@ -404,6 +459,7 @@ def normalize_observation_tensors(
     ready_queue = tensors["ready_queue"].clone()
     ready_queue[:, :, 0:2] = torch.log1p(ready_queue[:, :, 0:2])
     ready_queue[:, :, 2] = ready_queue[:, :, 2] / 2.0
+    ready_queue[:, :, 4:6] = torch.log1p(ready_queue[:, :, 4:6])
     tensors["ready_queue"] = ready_queue
 
     other_cores = tensors["other_cores"].clone()

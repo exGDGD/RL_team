@@ -1,6 +1,12 @@
 from argparse import Namespace
 
-from src.train_acac import reward_weights_from_args
+import pytest
+
+from src.train_acac import (
+    CHECKPOINT_VERSION,
+    reward_weights_from_args,
+    validate_checkpoint_version,
+)
 
 
 def test_training_reward_defaults_to_cost_only_objective() -> None:
@@ -26,3 +32,12 @@ def test_training_reward_shaping_can_be_enabled_explicitly() -> None:
     assert weights.progress_work == 1.0
     assert weights.completion == 5.0
     assert weights.completion_work == 5.0
+
+
+def test_resume_rejects_checkpoint_from_another_training_algorithm() -> None:
+    with pytest.raises(SystemExit, match="Checkpoint version mismatch"):
+        validate_checkpoint_version({})
+
+
+def test_resume_accepts_current_checkpoint_version() -> None:
+    validate_checkpoint_version({"checkpoint_version": CHECKPOINT_VERSION})
