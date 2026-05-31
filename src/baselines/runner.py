@@ -13,6 +13,7 @@ class EpisodeResult:
     steps: int
     total_reward: float
     metrics: EpisodeMetrics
+    reward_diagnostics: dict[str, float]
     terminated: bool
     truncated: bool
 
@@ -22,6 +23,7 @@ class EpisodeResult:
             "steps": self.steps,
             "total_reward": self.total_reward,
             **self.metrics.as_dict(),
+            "reward_diagnostics": self.reward_diagnostics,
             "terminated": self.terminated,
             "truncated": self.truncated,
         }
@@ -52,6 +54,7 @@ def run_episode(
                 steps=step_idx,
                 total_reward=total_reward,
                 metrics=env.metrics(),
+                reward_diagnostics=env.reward_diagnostics(),
                 terminated=terminated,
                 truncated=truncated,
             )
@@ -61,6 +64,7 @@ def run_episode(
         steps=max_steps,
         total_reward=total_reward,
         metrics=env.metrics(),
+        reward_diagnostics=env.reward_diagnostics(),
         terminated=False,
         truncated=True,
     )

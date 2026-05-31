@@ -7,6 +7,7 @@ from src.env import (
     Task,
     WorkloadScenario,
 )
+import numpy as np
 import pytest
 
 
@@ -297,3 +298,49 @@ def test_event_shaped_reward_mode_adds_cpu_work_progress() -> None:
     )
 
     assert reward == -4.0
+
+
+def test_starvation_cost_uses_mean_and_max_log_wait() -> None:
+    env = SchedulerEnv(
+        reward_weights=RewardWeights(
+            starvation_max_wait_weight=0.5,
+        ),
+    )
+    env.sim = type("Sim", (), {"now": 10.0})()
+    env.ready_queue = [
+        Task(
+            pid=0,
+            arrival_time=0.0,
+            cpu_intensity=0.5,
+            latency_class=LatencyClass.BEST_EFFORT,
+            cpu_bursts=[1.0],
+            ready_since=0.0,
+        ),
+        Task(
+            pid=1,
+            arrival_time=0.0,
+            cpu_intensity=0.5,
+            latency_class=LatencyClass.BEST_EFFORT,
+            cpu_bursts=[1.0],
+            ready_since=6.0,
+        ),
+    ]
+    core = env._build_cores()["p_0"]
+
+    _, starvation_cost = env._burst_costs(core, run_time=2.0)
+
+    expected = (
+        (np.log1p(10.0) + np.log1p(4.0)) / 2.0
+        + 0.5 * np.log1p(10.0)
+    ) * 2.0
+    assert starvation_cost == pytest.approx(expected)
+
+
+def test_starvation_cost_is_zero_for_empty_ready_queue() -> None:
+    env = SchedulerEnv()
+    env.ready_queue = []
+    core = env._build_cores()["p_0"]
+
+    _, starvation_cost = env._burst_costs(core, run_time=2.0)
+
+    assert starvation_cost == 0.0

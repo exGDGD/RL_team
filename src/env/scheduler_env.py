@@ -28,12 +28,11 @@ class RewardWeights:
     completion: float = 5.0
     completion_work: float = 5.0
     energy: float = 0.1
-    starvation: float = 0.001
+    starvation: float = 0.1
     latency: float = 0.05
     context_switch: float = 1.0
     work_norm: float = 10.0
-    starvation_wait_clip: float = 100.0
-    starvation_power: float = 2.0
+    starvation_max_wait_weight: float = 0.5
 
 
 class RewardMode(str, Enum):
@@ -193,6 +192,33 @@ class SchedulerEnv:
             now=self.sim.now,
             starvation_threshold=starvation_threshold,
         )
+
+    def reward_diagnostics(self) -> dict[str, float]:
+        """Return unweighted reward components for experiment inspection."""
+
+        completed = [task for task in self.tasks.values() if task.done]
+        raw = {
+            "cpu_work": float(sum(task.cpu_progress for task in self.tasks.values())),
+            "energy_cost": float(
+                sum(task.accumulated_energy_cost for task in self.tasks.values())
+            ),
+            "starvation_cost": float(
+                sum(task.accumulated_starvation_cost for task in self.tasks.values())
+            ),
+            "latency_cost": float(
+                sum(
+                    float(task.latency_class) * float(task.turnaround_time() or 0.0)
+                    for task in completed
+                )
+            ),
+        }
+        weights = self.reward_weights
+        return {
+            **raw,
+            "weighted_energy_cost": weights.energy * raw["energy_cost"],
+            "weighted_starvation_cost": weights.starvation * raw["starvation_cost"],
+            "weighted_latency_cost": weights.latency * raw["latency_cost"],
+        }
 
     def _build_cores(self) -> dict[str, Core]:
         cores: dict[str, Core] = {}
@@ -361,14 +387,15 @@ class SchedulerEnv:
     def _burst_costs(self, core: Core, run_time: float) -> tuple[float, float]:
         weights = self.reward_weights
         energy_cost = core.spec.power * run_time
+        waiting_times = [t.waiting_time(self.sim.now) for t in self.ready_queue]
+        if not waiting_times:
+            return energy_cost, 0.0
+
+        log_waits = np.log1p(waiting_times)
         starvation_cost = (
-            sum(
-                min(t.waiting_time(self.sim.now), weights.starvation_wait_clip)
-                ** weights.starvation_power
-                for t in self.ready_queue
-            )
-            * run_time
-        )
+            float(np.mean(log_waits))
+            + weights.starvation_max_wait_weight * float(np.max(log_waits))
+        ) * run_time
         return energy_cost, starvation_cost
 
     def _reward_for_finished_burst(

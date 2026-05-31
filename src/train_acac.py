@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from src.env import CoreType, SchedulerEnv, WorkloadScenario
+from src.env import CoreType, RewardWeights, SchedulerEnv, WorkloadScenario
 from src.rl import collect_episode
 
 
@@ -22,6 +22,10 @@ def main() -> None:
     parser.add_argument("--arrival-rate", type=float, default=1.0)
     parser.add_argument("--episode-time", type=float, default=80.0)
     parser.add_argument("--max-tasks", type=int, default=64)
+    parser.add_argument("--lambda-energy", type=float, default=0.1)
+    parser.add_argument("--lambda-starvation", type=float, default=0.05)
+    parser.add_argument("--lambda-latency", type=float, default=0.1)
+    parser.add_argument("--starvation-max-wait-weight", type=float, default=0.5)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/acac_p2e2"))
@@ -107,7 +111,8 @@ def main() -> None:
                 "entropy={entropy:.3f} kl={kl:.4f} clip_frac={clip_fraction:.3f} "
                 "conflicts={conflicts} choices={choices:.2f} forced={forced:.2f} "
                 "eval_reward={eval_reward:.3f} "
-                "eval_completed={eval_completed:.1f} eas_reward={eas_reward:.3f}".format(
+                "eval_completed={eval_completed:.1f} random_reward={random_reward:.3f} "
+                "sjf_reward={sjf_reward:.3f} eas_reward={eas_reward:.3f}".format(
                     episode=episode_idx,
                     transitions=len(rollout),
                     reward=total_reward,
@@ -125,6 +130,8 @@ def main() -> None:
                     forced=rollout.forced_decision_fraction,
                     eval_reward=eval_summary["reward"],
                     eval_completed=eval_summary["completed"],
+                    random_reward=eval_summary["baselines"]["random"]["reward"],
+                    sjf_reward=eval_summary["baselines"]["sjf_like"]["reward"],
                     eas_reward=eval_summary["baselines"]["eas_like"]["reward"],
                 )
             )
@@ -164,6 +171,16 @@ def make_env(args: argparse.Namespace, *, seed: int) -> SchedulerEnv:
         episode_time=args.episode_time,
         max_tasks=args.max_tasks,
         seed=seed,
+        reward_weights=reward_weights_from_args(args),
+    )
+
+
+def reward_weights_from_args(args: argparse.Namespace) -> RewardWeights:
+    return RewardWeights(
+        energy=getattr(args, "lambda_energy", 0.1),
+        starvation=getattr(args, "lambda_starvation", 0.05),
+        latency=getattr(args, "lambda_latency", 0.1),
+        starvation_max_wait_weight=getattr(args, "starvation_max_wait_weight", 0.5),
     )
 
 
@@ -177,6 +194,7 @@ def evaluate_policy(
     rewards = []
     completed = []
     throughputs = []
+    diagnostics = []
     for offset in range(episodes):
         env = make_env(args, seed=base_seed + offset)
         rollout = collect_episode(
@@ -188,11 +206,13 @@ def evaluate_policy(
         metrics = env.metrics()
         completed.append(metrics.completed_tasks)
         throughputs.append(metrics.throughput)
+        diagnostics.append(env.reward_diagnostics())
 
     return {
         "reward": float(np.mean(rewards)),
         "completed": float(np.mean(completed)),
         "throughput": float(np.mean(throughputs)),
+        "reward_diagnostics": mean_dict(diagnostics),
         "baselines": evaluate_baselines(args, base_seed=base_seed, episodes=episodes),
     }
 
@@ -220,8 +240,25 @@ def evaluate_baselines(
             "reward": float(np.mean([result.total_reward for result in results])),
             "completed": float(np.mean([result.metrics.completed_tasks for result in results])),
             "throughput": float(np.mean([result.metrics.throughput for result in results])),
+            "energy": float(np.mean([result.metrics.total_energy for result in results])),
+            "turnaround": float(
+                np.mean([result.metrics.mean_turnaround_time for result in results])
+            ),
+            "ready_wait": float(
+                np.mean([result.metrics.mean_ready_wait_time for result in results])
+            ),
+            "reward_diagnostics": mean_dict(
+                [result.reward_diagnostics for result in results]
+            ),
         }
     return summaries
+
+
+def mean_dict(rows: list[dict[str, float]]) -> dict[str, float]:
+    return {
+        key: float(np.mean([row[key] for row in rows]))
+        for key in rows[0]
+    }
 
 
 def build_log_row(

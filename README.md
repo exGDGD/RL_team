@@ -139,6 +139,16 @@ python -m src.train_acac --episodes 100 --eval-every 10
 
 현재 학습 entrypoint는 `P2E2 + balanced workload` 고정 구성으로 시작합니다. 기본 arrival rate는 `1.0`, 최대 task 수는 `64`입니다. 너무 한산한 workload에서는 대부분의 decision에 선택 가능한 task가 하나뿐이라 정책을 학습할 수 없습니다. 출력의 `choices`와 `forced`를 함께 확인합니다. `SchedulerEnv`의 NO-OP는 아직 idle duration을 진행시키지 않으므로, 초기 ACAC sanity training에서는 NO-OP sampling을 비활성화합니다.
 
+Energy와 latency cost는 물리적으로 해석 가능한 raw 값을 유지하고 lambda로 trade-off를 조정합니다. Starvation cost는 queue 길이와 긴 대기시간 때문에 폭발하지 않도록 `mean(log1p(wait)) + beta * max(log1p(wait))`에 burst 실행 시간을 곱합니다. 초기 sanity training 값은 `energy=0.1`, `starvation=0.05`, `latency=0.1`, `beta=0.5`입니다.
+
+```bash
+python -m src.train_acac \
+  --lambda-energy 0.1 \
+  --lambda-starvation 0.05 \
+  --lambda-latency 0.1 \
+  --starvation-max-wait-weight 0.5
+```
+
 학습 중 `outputs/acac_p2e2/metrics.jsonl`, `latest.pt`, `best.pt`가 생성됩니다. Colab 런타임 종료 후에도 보존하려면 `--output-dir`에 Google Drive 경로를 넘깁니다. 중단된 학습은 다음처럼 이어서 실행합니다.
 
 ```bash
