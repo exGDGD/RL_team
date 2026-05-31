@@ -12,7 +12,8 @@ from src.rl.trainer import (
     ACACConfig,
     ACACTrainer,
     TorchACACPolicy,
-    compute_advantages,
+    compute_joint_advantages,
+    map_actor_advantages,
 )
 from src.train_acac import append_jsonl, save_checkpoint
 
@@ -28,7 +29,7 @@ class FirstValidPolicy:
         return actions, log_probs
 
 
-def test_compute_advantages_groups_transitions_by_agent() -> None:
+def test_compute_advantages_groups_transitions_by_episode() -> None:
     env = SchedulerEnv(
         core_config={CoreType.P: 1, CoreType.E: 1},
         workload_scenario=WorkloadScenario.BALANCED,
@@ -38,19 +39,19 @@ def test_compute_advantages_groups_transitions_by_agent() -> None:
         seed=3,
     )
     rollout = collect_episode(env, FirstValidPolicy(), seed=3)
-    values = np.zeros(len(rollout.transitions), dtype=np.float32)
-    next_values = np.zeros(len(rollout.transitions), dtype=np.float32)
+    values = np.zeros(len(rollout.joint_transitions), dtype=np.float32)
+    next_values = np.zeros(len(rollout.joint_transitions), dtype=np.float32)
 
-    advantages, returns = compute_advantages(
-        transitions=rollout.transitions,
+    advantages, returns = compute_joint_advantages(
+        transitions=rollout.joint_transitions,
         values=values,
         next_values=next_values,
         gamma=0.99,
         gae_lambda=0.95,
     )
 
-    assert advantages.shape == (len(rollout.transitions),)
-    assert returns.shape == (len(rollout.transitions),)
+    assert advantages.shape == (len(rollout.joint_transitions),)
+    assert returns.shape == (len(rollout.joint_transitions),)
 
 
 def test_torch_acac_policy_can_update_from_collected_rollout() -> None:
@@ -82,13 +83,13 @@ def test_compute_advantages_does_not_cross_episode_boundaries() -> None:
         max_tasks=2,
         seed=3,
     )
-    transition = collect_episode(env, FirstValidPolicy(), seed=3).transitions[0]
+    transition = collect_episode(env, FirstValidPolicy(), seed=3).joint_transitions[0]
     transitions = [
         replace(transition, episode_id=0, reward=1.0, terminated=False),
         replace(transition, episode_id=1, reward=2.0, terminated=False),
     ]
 
-    advantages, _ = compute_advantages(
+    advantages, _ = compute_joint_advantages(
         transitions=transitions,
         values=np.zeros(2, dtype=np.float32),
         next_values=np.zeros(2, dtype=np.float32),
@@ -97,6 +98,29 @@ def test_compute_advantages_does_not_cross_episode_boundaries() -> None:
     )
 
     assert advantages.tolist() == pytest.approx([1.0, 2.0])
+
+
+def test_actor_advantages_use_macro_action_start_joint_index() -> None:
+    env = SchedulerEnv(
+        core_config={CoreType.P: 1},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=0.5,
+        episode_time=30.0,
+        max_tasks=2,
+        seed=3,
+    )
+    transition = collect_episode(env, FirstValidPolicy(), seed=3).transitions[0]
+    transitions = [
+        replace(transition, joint_index=1),
+        replace(transition, joint_index=0),
+    ]
+
+    advantages = map_actor_advantages(
+        transitions=transitions,
+        joint_advantages=np.array([3.0, 7.0], dtype=np.float32),
+    )
+
+    assert advantages.tolist() == pytest.approx([7.0, 3.0])
 
 
 def test_checkpoint_and_jsonl_log_can_be_written(tmp_path: Path) -> None:

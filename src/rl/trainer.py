@@ -9,7 +9,12 @@ from torch.distributions import Categorical
 
 from src.env import CoreType
 
-from .buffer import AgentTransition, RolloutBuffer, compute_time_scaled_gae
+from .buffer import (
+    AgentTransition,
+    JointMacroTransition,
+    RolloutBuffer,
+    compute_time_scaled_gae,
+)
 from .networks import AgentCentricCritic, TypeSharedActor
 from .obs import AgentBatch
 
@@ -20,14 +25,14 @@ class ACACConfig:
     critic_heads: int = 4
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_ratio: float = 0.2
+    clip_ratio: float = 0.05
     value_coef: float = 0.5
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.0
     max_grad_norm: float = 0.5
-    actor_learning_rate: float = 1.0e-3
+    actor_learning_rate: float = 3.0e-4
     critic_learning_rate: float = 3.0e-4
     allow_noop: bool = False
-    update_epochs: int = 4
+    update_epochs: int = 2
     reward_scale: float = 0.01
 
 
@@ -110,12 +115,11 @@ class TorchACACPolicy(nn.Module):
     def evaluate_transitions(
         self,
         transitions: list[AgentTransition],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         log_probs: list[torch.Tensor] = []
         entropies: list[torch.Tensor] = []
-        values: list[torch.Tensor] = []
 
-        for idx, transition in enumerate(transitions):
+        for transition in transitions:
             tensors = transition_row_to_tensors(transition, self.device)
             tensors["action_mask"] = torch.as_tensor(
                 transition.action_mask,
@@ -128,13 +132,12 @@ class TorchACACPolicy(nn.Module):
             action = torch.tensor([transition.action], dtype=torch.long, device=self.device)
             log_probs.append(dist.log_prob(action).squeeze(0))
             entropies.append(dist.entropy().squeeze(0))
-            values.append(self.critic(**_critic_inputs(tensors)).squeeze(0))
 
         if not transitions:
             empty = torch.empty(0, device=self.device)
-            return empty, empty, empty
+            return empty, empty
 
-        return torch.stack(log_probs), torch.stack(entropies), torch.stack(values)
+        return torch.stack(log_probs), torch.stack(entropies)
 
     def _apply_policy_action_mask(
         self,
@@ -147,21 +150,38 @@ class TorchACACPolicy(nn.Module):
         tensors["action_mask"][:, 0] = False
         return tensors
 
-    def values_for_transitions(
+    def values_for_joint_transitions(
         self,
-        transitions: list[AgentTransition],
+        transitions: list[JointMacroTransition],
         *,
         next_obs: bool = False,
     ) -> torch.Tensor:
         values = []
         with torch.no_grad():
             for transition in transitions:
-                tensors = transition_row_to_tensors(
-                    transition,
+                batch = transition.next_obs if next_obs else transition.obs
+                tensors = batch_rows_to_tensors(
+                    batch,
+                    list(range(batch.num_agents)),
                     self.device,
-                    next_obs=next_obs,
                 )
-                values.append(self.critic(**_critic_inputs(tensors)).squeeze(0))
+                values.append(self.critic(**_critic_inputs(tensors)).mean())
+        if not values:
+            return torch.empty(0, device=self.device)
+        return torch.stack(values)
+
+    def evaluate_joint_transitions(
+        self,
+        transitions: list[JointMacroTransition],
+    ) -> torch.Tensor:
+        values = []
+        for transition in transitions:
+            tensors = batch_rows_to_tensors(
+                transition.obs,
+                list(range(transition.obs.num_agents)),
+                self.device,
+            )
+            values.append(self.critic(**_critic_inputs(tensors)).mean())
         if not values:
             return torch.empty(0, device=self.device)
         return torch.stack(values)
@@ -191,19 +211,27 @@ class ACACTrainer:
 
     def update(self, rollout: RolloutBuffer) -> UpdateStats:
         transitions = rollout.transitions
-        if not transitions:
+        joint_transitions = rollout.joint_transitions
+        if not transitions or not joint_transitions:
             raise ValueError("Cannot update from an empty rollout buffer.")
 
         with torch.no_grad():
-            old_values = self.policy.values_for_transitions(transitions)
-            next_values = self.policy.values_for_transitions(transitions, next_obs=True)
-            advantages, returns = compute_advantages(
-                transitions=transitions,
+            old_values = self.policy.values_for_joint_transitions(joint_transitions)
+            next_values = self.policy.values_for_joint_transitions(
+                joint_transitions,
+                next_obs=True,
+            )
+            joint_advantages, joint_returns = compute_joint_advantages(
+                transitions=joint_transitions,
                 values=old_values.cpu().numpy(),
                 next_values=next_values.cpu().numpy(),
                 gamma=self.config.gamma,
                 gae_lambda=self.config.gae_lambda,
                 reward_scale=self.config.reward_scale,
+            )
+            advantages = map_actor_advantages(
+                transitions=transitions,
+                joint_advantages=joint_advantages,
             )
 
         old_log_probs = torch.tensor(
@@ -212,12 +240,13 @@ class ACACTrainer:
             device=self.policy.device,
         )
         advantages_t = torch.tensor(advantages, dtype=torch.float32, device=self.policy.device)
-        returns_t = torch.tensor(returns, dtype=torch.float32, device=self.policy.device)
+        returns_t = torch.tensor(joint_returns, dtype=torch.float32, device=self.policy.device)
         advantages_t = normalize_advantages(advantages_t)
 
         epoch_stats = []
         for _ in range(self.config.update_epochs):
-            new_log_probs, entropies, values = self.policy.evaluate_transitions(transitions)
+            new_log_probs, entropies = self.policy.evaluate_transitions(transitions)
+            values = self.policy.evaluate_joint_transitions(joint_transitions)
             ratio = torch.exp(new_log_probs - old_log_probs)
             clipped_ratio = torch.clamp(
                 ratio,
@@ -280,13 +309,13 @@ class ACACTrainer:
             critic_grad_norm=float(means[7]),
             advantage_mean=float(np.mean(advantages)),
             advantage_std=float(np.std(advantages)),
-            return_mean=float(np.mean(returns)),
+            return_mean=float(np.mean(joint_returns)),
         )
 
 
-def compute_advantages(
+def compute_joint_advantages(
     *,
-    transitions: list[AgentTransition],
+    transitions: list[JointMacroTransition],
     values: np.ndarray,
     next_values: np.ndarray,
     gamma: float,
@@ -296,10 +325,9 @@ def compute_advantages(
     advantages = np.zeros(len(transitions), dtype=np.float32)
     returns = np.zeros(len(transitions), dtype=np.float32)
 
-    by_agent: dict[tuple[int, str], list[int]] = {}
+    by_episode: dict[int, list[int]] = {}
     for idx, transition in enumerate(transitions):
-        key = (transition.episode_id, transition.agent_id)
-        by_agent.setdefault(key, []).append(idx)
+        by_episode.setdefault(transition.episode_id, []).append(idx)
 
     rewards = np.array(
         [transition.reward * reward_scale for transition in transitions],
@@ -311,8 +339,8 @@ def compute_advantages(
         dtype=bool,
     )
 
-    for indices in by_agent.values():
-        agent_advantages, agent_returns = compute_time_scaled_gae(
+    for indices in by_episode.values():
+        episode_advantages, episode_returns = compute_time_scaled_gae(
             rewards=rewards[indices],
             values=values[indices],
             next_values=next_values[indices],
@@ -321,10 +349,21 @@ def compute_advantages(
             gamma=gamma,
             gae_lambda=gae_lambda,
         )
-        advantages[indices] = agent_advantages
-        returns[indices] = agent_returns
+        advantages[indices] = episode_advantages
+        returns[indices] = episode_returns
 
     return advantages, returns
+
+
+def map_actor_advantages(
+    *,
+    transitions: list[AgentTransition],
+    joint_advantages: np.ndarray,
+) -> np.ndarray:
+    return np.asarray(
+        [joint_advantages[transition.joint_index] for transition in transitions],
+        dtype=np.float32,
+    )
 
 
 def normalize_advantages(advantages: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:

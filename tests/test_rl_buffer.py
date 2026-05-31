@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.rl import RolloutBuffer, compute_time_scaled_gae
+from src.rl import JointMacroTransition, RolloutBuffer, compute_time_scaled_gae
 
 
 def test_time_scaled_gae_matches_one_step_td_when_lambda_zero() -> None:
@@ -82,3 +82,38 @@ def test_rollout_buffer_extend_aggregates_diagnostics() -> None:
     assert target.forced_decisions == 3
     assert target.mean_task_choices == pytest.approx(12 / 5)
     assert target.max_task_choices == 5
+
+
+def test_rollout_buffer_extend_offsets_joint_episode_ids() -> None:
+    target = RolloutBuffer(
+        episodes=1,
+        joint_transitions=[
+            JointMacroTransition(
+                episode_id=0,
+                obs=object(),
+                reward=1.0,
+                next_obs=object(),
+                elapsed_time=1.0,
+                terminated=True,
+                truncated=False,
+            )
+        ],
+    )
+    other = RolloutBuffer(
+        episodes=1,
+        joint_transitions=[
+            JointMacroTransition(
+                episode_id=0,
+                obs=object(),
+                reward=2.0,
+                next_obs=object(),
+                elapsed_time=1.0,
+                terminated=True,
+                truncated=False,
+            )
+        ],
+    )
+
+    target.extend(other)
+
+    assert [transition.episode_id for transition in target.joint_transitions] == [0, 1]

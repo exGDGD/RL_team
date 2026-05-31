@@ -17,9 +17,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Single-config ACAC sanity training.")
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--eval-every", type=int, default=10)
-    parser.add_argument("--eval-episodes", type=int, default=5)
+    parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--eval-seed", type=int, default=10_000)
-    parser.add_argument("--rollout-episodes", type=int, default=4)
+    parser.add_argument("--rollout-episodes", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--arrival-rate", type=float, default=1.0)
     parser.add_argument("--episode-time", type=float, default=80.0)
@@ -33,8 +33,11 @@ def main() -> None:
     parser.add_argument("--starvation-max-wait-weight", type=float, default=0.5)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--reward-scale", type=float, default=0.01)
-    parser.add_argument("--actor-learning-rate", type=float, default=1.0e-3)
+    parser.add_argument("--actor-learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--critic-learning-rate", type=float, default=3.0e-4)
+    parser.add_argument("--clip-ratio", type=float, default=0.05)
+    parser.add_argument("--entropy-coef", type=float, default=0.0)
+    parser.add_argument("--update-epochs", type=int, default=2)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/acac_p2e2"))
     parser.add_argument("--save-every", type=int, default=10)
@@ -64,6 +67,9 @@ def main() -> None:
         reward_scale=args.reward_scale,
         actor_learning_rate=args.actor_learning_rate,
         critic_learning_rate=args.critic_learning_rate,
+        clip_ratio=args.clip_ratio,
+        entropy_coef=args.entropy_coef,
+        update_epochs=args.update_epochs,
     )
     policy = TorchACACPolicy(config, device=args.device)
     trainer = ACACTrainer(policy)
@@ -97,7 +103,14 @@ def main() -> None:
                 + 1
             )
             env = make_env(args, seed=rollout_seed)
-            rollout.extend(collect_episode(env, policy, seed=rollout_seed))
+            rollout.extend(
+                collect_episode(
+                    env,
+                    policy,
+                    seed=rollout_seed,
+                    gamma=config.gamma,
+                )
+            )
         if len(rollout) == 0:
             print(f"episode={episode_idx} skipped empty rollout")
             continue
@@ -129,7 +142,7 @@ def main() -> None:
 
         if eval_summary is not None:
             print(
-                "episode={episode} transitions={transitions} reward={reward:.3f} "
+                "episode={episode} transitions={transitions} joints={joints} reward={reward:.3f} "
                 "completed={completed}/{total} throughput={throughput:.3f} "
                 "turnaround={turnaround} loss={loss:.3f} value_loss={value_loss:.3f} "
                 "entropy={entropy:.3f} kl={kl:.4f} clip_frac={clip_fraction:.3f} "
@@ -142,6 +155,7 @@ def main() -> None:
                 "sjf_reward={sjf_reward:.3f} eas_reward={eas_reward:.3f}".format(
                     episode=episode_idx,
                     transitions=len(rollout),
+                    joints=len(rollout.joint_transitions),
                     reward=total_reward,
                     completed=metrics.completed_tasks,
                     total=metrics.total_tasks,
@@ -265,6 +279,7 @@ def evaluate_rl_policy(
                 env,
                 EvaluationPolicy(policy, deterministic=deterministic),
                 seed=base_seed + offset,
+                gamma=policy.config.gamma,
             )
             rewards.append(rollout.total_env_reward)
             metrics = env.metrics()
@@ -391,6 +406,7 @@ def build_log_row(
     return {
         "episode": episode_idx,
         "transitions": len(rollout),
+        "joint_intervals": len(rollout.joint_transitions),
         "env_steps": rollout.env_steps,
         "conflicts": rollout.conflicts,
         "invalid_actions": rollout.invalid_actions,

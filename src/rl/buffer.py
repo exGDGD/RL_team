@@ -18,6 +18,7 @@ class PendingDecision:
     log_prob: float
     action_mask: np.ndarray
     start_time: float
+    joint_index: int
     accumulated_reward: float = 0.0
 
 
@@ -35,6 +36,20 @@ class AgentTransition:
     reward: float
     next_obs: AgentBatch
     next_agent_index: int
+    joint_index: int
+    elapsed_time: float
+    terminated: bool
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class JointMacroTransition:
+    """One interval on the shared macro-timeline used by the ACAC critic."""
+
+    episode_id: int
+    obs: AgentBatch
+    reward: float
+    next_obs: AgentBatch
     elapsed_time: float
     terminated: bool
     truncated: bool
@@ -43,6 +58,7 @@ class AgentTransition:
 @dataclass
 class RolloutBuffer:
     transitions: list[AgentTransition] = field(default_factory=list)
+    joint_transitions: list[JointMacroTransition] = field(default_factory=list)
     episodes: int = 0
     total_env_reward: float = 0.0
     env_steps: int = 0
@@ -56,13 +72,25 @@ class RolloutBuffer:
     def append(self, transition: AgentTransition) -> None:
         self.transitions.append(transition)
 
+    def append_joint(self, transition: JointMacroTransition) -> None:
+        self.joint_transitions.append(transition)
+
     def extend(self, other: RolloutBuffer) -> None:
+        joint_index_offset = len(self.joint_transitions)
         self.transitions.extend(
             replace(
                 transition,
                 episode_id=transition.episode_id + self.episodes,
+                joint_index=transition.joint_index + joint_index_offset,
             )
             for transition in other.transitions
+        )
+        self.joint_transitions.extend(
+            replace(
+                transition,
+                episode_id=transition.episode_id + self.episodes,
+            )
+            for transition in other.joint_transitions
         )
         self.episodes += other.episodes
         self.total_env_reward += other.total_env_reward

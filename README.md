@@ -139,14 +139,19 @@ python -m src.train_acac --episodes 100 --eval-every 10
 
 현재 학습 entrypoint는 `P2E2 + balanced workload` 고정 구성으로 시작합니다. 기본 arrival rate는 `1.0`, 최대 task 수는 `64`입니다. 너무 한산한 workload에서는 대부분의 decision에 선택 가능한 task가 하나뿐이라 정책을 학습할 수 없습니다. 출력의 `choices`와 `forced`를 함께 확인합니다. `SchedulerEnv`의 NO-OP는 아직 idle duration을 진행시키지 않으므로, 초기 ACAC sanity training에서는 NO-OP sampling을 비활성화합니다.
 
-학습 update 한 번에는 기본적으로 4개 episode rollout을 합칩니다. 비동기 macro-action transition은 해당 action 실행 중 발생한 system-wide team reward를 누적합니다. 콘솔과 평가의 reward는 중복 누적된 transition 합이 아니라 환경이 실제로 방출한 episode reward입니다. critic target은 raw 평가 reward와 분리하여 `reward_scale=0.01`을 적용하고, actor와 critic gradient clipping도 별도로 수행합니다. 입력 observation의 대기시간, 진행시간, 누적 에너지는 MLP에 넣기 전에 `log1p`로 안정화합니다.
+학습 update 한 번에는 기본적으로 16개 episode rollout을 합칩니다. ACAC critic은 누군가 새 scheduling decision을 만드는 시점을 shared joint macro-timestep으로 사용합니다. 각 joint interval 내부의 system-wide team reward는 simulated elapsed time에 따라 할인하고 agent 수로 평균냅니다. Joint timeline에서 GAE를 한 번 계산한 뒤, 각 actor action은 자신이 시작된 joint macro-timestep의 advantage를 사용합니다. 콘솔과 평가의 reward는 학습용 평균 reward가 아니라 환경이 실제로 방출한 episode 총점입니다. critic target은 raw 평가 reward와 분리하여 `reward_scale=0.01`을 적용하고, actor와 critic gradient clipping도 별도로 수행합니다. 입력 observation의 대기시간, 진행시간, 누적 에너지는 MLP에 넣기 전에 `log1p`로 안정화합니다.
+
+현재 구현은 joint macro-timeline GAE까지 반영한 단계입니다. 공식 ACAC의 GRU history encoder, time embedding, PopArt value normalization, target critic은 이후 단계에서 추가합니다.
 
 ```bash
 python -m src.train_acac \
-  --rollout-episodes 4 \
+  --rollout-episodes 16 \
   --reward-scale 0.01 \
-  --actor-learning-rate 0.001 \
-  --critic-learning-rate 0.0003
+  --actor-learning-rate 0.0003 \
+  --critic-learning-rate 0.0003 \
+  --clip-ratio 0.05 \
+  --entropy-coef 0.0 \
+  --update-epochs 2
 ```
 
 Energy와 latency cost는 물리적으로 해석 가능한 raw 값을 유지하고 lambda로 trade-off를 조정합니다. Starvation cost는 queue 길이와 긴 대기시간 때문에 폭발하지 않도록 `mean(log1p(wait)) + beta * max(log1p(wait))`에 burst 실행 시간을 곱합니다. 초기 sanity training은 모든 task가 완료되는 trace를 사용하므로 episode 합에서 거의 상수인 progress/completion shaping은 끕니다. 정책 차이가 충분히 보이도록 `progress=0.0`, `completion=0.0`, `completion_work=0.0`, `energy=0.1`, `starvation=0.05`, `latency=0.5`, `beta=0.5`를 사용합니다. Cost-only reward는 0에 가까울수록 좋습니다.

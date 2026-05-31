@@ -9,6 +9,7 @@ from .obs import (
 from .rollout import RolloutPolicy, collect_episode
 from .buffer import (
     AgentTransition,
+    JointMacroTransition,
     PendingDecision,
     RolloutBuffer,
     compute_time_scaled_gae,
@@ -17,6 +18,7 @@ from .buffer import (
 __all__ = [
     "AgentBatch",
     "AgentTransition",
+    "JointMacroTransition",
     "PendingDecision",
     "RolloutBuffer",
     "RolloutPolicy",
