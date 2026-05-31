@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Protocol
 
 from src.env import SchedulerEnv
@@ -67,6 +68,8 @@ def collect_episode(
 
         next_observations, rewards, terminations, truncations, next_info = env.step(actions)
         buffer.env_steps += 1
+        team_reward = float(sum(rewards.values()))
+        buffer.total_env_reward += team_reward
         buffer.conflicts += len(next_info.get("conflicts", {}))
         buffer.invalid_actions += len(next_info.get("invalid_actions", {}))
         _discard_rejected_decisions(
@@ -74,6 +77,7 @@ def collect_episode(
             proposed_agent_ids=proposed_agent_ids,
             assigned_agent_ids=set(next_info.get("assignments", {})),
         )
+        _accumulate_team_reward(pending=pending, team_reward=team_reward)
         next_batch = build_agent_batch(next_observations, agent_order=env.agents)
         terminated = all(terminations.values())
         truncated = all(truncations.values())
@@ -81,7 +85,6 @@ def collect_episode(
         _close_finished_decisions(
             pending=pending,
             buffer=buffer,
-            rewards=rewards,
             finished_agent_ids={
                 event["core_id"] for event in next_info.get("finished_runs", [])
             },
@@ -99,7 +102,6 @@ def collect_episode(
     _close_finished_decisions(
         pending=pending,
         buffer=buffer,
-        rewards={agent_id: 0.0 for agent_id in env.agents},
         finished_agent_ids=set(),
         next_batch=batch,
         next_time=float(info["time"]),
@@ -127,11 +129,22 @@ def _discard_rejected_decisions(
         del pending[agent_id]
 
 
+def _accumulate_team_reward(
+    *,
+    pending: dict[str, PendingDecision],
+    team_reward: float,
+) -> None:
+    for agent_id, decision in pending.items():
+        pending[agent_id] = replace(
+            decision,
+            accumulated_reward=decision.accumulated_reward + team_reward,
+        )
+
+
 def _close_finished_decisions(
     *,
     pending: dict[str, PendingDecision],
     buffer: RolloutBuffer,
-    rewards: dict[str, float],
     finished_agent_ids: set[str],
     next_batch: AgentBatch,
     next_time: float,
@@ -154,7 +167,7 @@ def _close_finished_decisions(
                 action=decision.action,
                 log_prob=decision.log_prob,
                 action_mask=decision.action_mask,
-                reward=float(rewards.get(agent_id, 0.0)),
+                reward=decision.accumulated_reward,
                 next_obs=next_batch,
                 next_agent_index=next_agent_index,
                 elapsed_time=max(0.0, next_time - decision.start_time),

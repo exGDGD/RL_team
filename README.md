@@ -139,7 +139,7 @@ python -m src.train_acac --episodes 100 --eval-every 10
 
 현재 학습 entrypoint는 `P2E2 + balanced workload` 고정 구성으로 시작합니다. 기본 arrival rate는 `1.0`, 최대 task 수는 `64`입니다. 너무 한산한 workload에서는 대부분의 decision에 선택 가능한 task가 하나뿐이라 정책을 학습할 수 없습니다. 출력의 `choices`와 `forced`를 함께 확인합니다. `SchedulerEnv`의 NO-OP는 아직 idle duration을 진행시키지 않으므로, 초기 ACAC sanity training에서는 NO-OP sampling을 비활성화합니다.
 
-학습 update 한 번에는 기본적으로 4개 episode rollout을 합칩니다. critic target은 raw 평가 reward와 분리하여 `reward_scale=0.01`을 적용하고, actor와 critic gradient clipping도 별도로 수행합니다. 입력 observation의 대기시간, 진행시간, 누적 에너지는 MLP에 넣기 전에 `log1p`로 안정화합니다.
+학습 update 한 번에는 기본적으로 4개 episode rollout을 합칩니다. 비동기 macro-action transition은 해당 action 실행 중 발생한 system-wide team reward를 누적합니다. 콘솔과 평가의 reward는 중복 누적된 transition 합이 아니라 환경이 실제로 방출한 episode reward입니다. critic target은 raw 평가 reward와 분리하여 `reward_scale=0.01`을 적용하고, actor와 critic gradient clipping도 별도로 수행합니다. 입력 observation의 대기시간, 진행시간, 누적 에너지는 MLP에 넣기 전에 `log1p`로 안정화합니다.
 
 ```bash
 python -m src.train_acac \

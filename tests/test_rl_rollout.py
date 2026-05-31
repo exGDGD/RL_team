@@ -1,6 +1,9 @@
+import numpy as np
+import pytest
+
 from src.env import CoreType, SchedulerEnv, WorkloadScenario
-from src.rl import AgentBatch, RolloutBuffer, collect_episode
-from src.rl.rollout import _discard_rejected_decisions
+from src.rl import AgentBatch, PendingDecision, RolloutBuffer, collect_episode
+from src.rl.rollout import _accumulate_team_reward, _discard_rejected_decisions
 from src.train_acac import summarize_rollout_actions
 
 
@@ -59,6 +62,23 @@ def test_collect_episode_does_not_store_noop_as_pending_macro_action() -> None:
     assert len(buffer) == 0
 
 
+def test_single_agent_transition_rewards_match_environment_reward() -> None:
+    env = SchedulerEnv(
+        core_config={CoreType.P: 1},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=0.5,
+        episode_time=30.0,
+        max_tasks=4,
+        seed=3,
+    )
+
+    buffer = collect_episode(env, FirstValidPolicy(), seed=3)
+
+    assert sum(transition.reward for transition in buffer.transitions) == pytest.approx(
+        buffer.total_env_reward
+    )
+
+
 def test_rejected_conflict_decision_is_removed_from_pending() -> None:
     pending = {"p_0": object(), "p_1": object()}
 
@@ -69,6 +89,25 @@ def test_rejected_conflict_decision_is_removed_from_pending() -> None:
     )
 
     assert set(pending) == {"p_0"}
+
+
+def test_pending_macro_action_accumulates_team_reward() -> None:
+    pending = {
+        "p_0": PendingDecision(
+            agent_id="p_0",
+            agent_index=0,
+            obs=object(),
+            action=1,
+            log_prob=0.0,
+            action_mask=np.array([False, True]),
+            start_time=0.0,
+        ),
+    }
+
+    _accumulate_team_reward(pending=pending, team_reward=-2.5)
+    _accumulate_team_reward(pending=pending, team_reward=1.0)
+
+    assert pending["p_0"].accumulated_reward == -1.5
 
 
 def test_combined_rollouts_receive_distinct_episode_ids() -> None:

@@ -50,6 +50,7 @@ def test_time_scaled_gae_rejects_mismatched_shapes() -> None:
 def test_rollout_buffer_extend_aggregates_diagnostics() -> None:
     target = RolloutBuffer(
         episodes=1,
+        total_env_reward=2.5,
         env_steps=2,
         conflicts=1,
         invalid_actions=1,
@@ -60,6 +61,7 @@ def test_rollout_buffer_extend_aggregates_diagnostics() -> None:
     )
     other = RolloutBuffer(
         episodes=2,
+        total_env_reward=3.5,
         env_steps=4,
         conflicts=2,
         invalid_actions=0,
@@ -72,6 +74,7 @@ def test_rollout_buffer_extend_aggregates_diagnostics() -> None:
     target.extend(other)
 
     assert target.episodes == 3
+    assert target.total_env_reward == pytest.approx(6.0)
     assert target.env_steps == 6
     assert target.conflicts == 3
     assert target.invalid_actions == 1

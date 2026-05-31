@@ -104,10 +104,7 @@ def main() -> None:
 
         assert env is not None
         stats = trainer.update(rollout)
-        total_reward = (
-            sum(transition.reward for transition in rollout.transitions)
-            / args.rollout_episodes
-        )
+        total_reward = rollout.total_env_reward / args.rollout_episodes
         metrics = env.metrics()
         should_eval = episode_idx == start_episode or episode_idx % args.eval_every == 0
         eval_summary = (
@@ -269,7 +266,7 @@ def evaluate_rl_policy(
                 EvaluationPolicy(policy, deterministic=deterministic),
                 seed=base_seed + offset,
             )
-            rewards.append(sum(transition.reward for transition in rollout.transitions))
+            rewards.append(rollout.total_env_reward)
             metrics = env.metrics()
             completed.append(metrics.completed_tasks)
             throughputs.append(metrics.throughput)
@@ -402,6 +399,10 @@ def build_log_row(
         "max_task_choices": rollout.max_task_choices,
         "forced_decision_fraction": rollout.forced_decision_fraction,
         "reward": total_reward,
+        "transition_reward": float(
+            sum(transition.reward for transition in rollout.transitions)
+            / max(rollout.episodes, 1)
+        ),
         "mean_elapsed_time": float(np.mean(elapsed_times)),
         "actions": summarize_rollout_actions(rollout),
         "metrics": metrics.as_dict(),

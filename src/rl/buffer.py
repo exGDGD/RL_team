@@ -18,6 +18,7 @@ class PendingDecision:
     log_prob: float
     action_mask: np.ndarray
     start_time: float
+    accumulated_reward: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class AgentTransition:
 class RolloutBuffer:
     transitions: list[AgentTransition] = field(default_factory=list)
     episodes: int = 0
+    total_env_reward: float = 0.0
     env_steps: int = 0
     conflicts: int = 0
     invalid_actions: int = 0
@@ -63,6 +65,7 @@ class RolloutBuffer:
             for transition in other.transitions
         )
         self.episodes += other.episodes
+        self.total_env_reward += other.total_env_reward
         self.env_steps += other.env_steps
         self.conflicts += other.conflicts
         self.invalid_actions += other.invalid_actions
