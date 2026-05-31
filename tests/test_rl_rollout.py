@@ -37,6 +37,9 @@ def test_collect_episode_returns_agent_centric_transitions() -> None:
     assert len(buffer) > 0
     assert all(transition.agent_id in env.agents for transition in buffer.transitions)
     assert all(transition.elapsed_time >= 0.0 for transition in buffer.transitions)
+    assert buffer.decisions > 0
+    assert buffer.mean_task_choices >= 1.0
+    assert 0.0 <= buffer.forced_decision_fraction <= 1.0
     assert env.completed_tasks
 
 

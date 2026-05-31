@@ -44,9 +44,25 @@ class RolloutBuffer:
     env_steps: int = 0
     conflicts: int = 0
     invalid_actions: int = 0
+    decisions: int = 0
+    forced_decisions: int = 0
+    total_task_choices: int = 0
+    max_task_choices: int = 0
 
     def append(self, transition: AgentTransition) -> None:
         self.transitions.append(transition)
+
+    @property
+    def mean_task_choices(self) -> float:
+        if self.decisions == 0:
+            return 0.0
+        return self.total_task_choices / self.decisions
+
+    @property
+    def forced_decision_fraction(self) -> float:
+        if self.decisions == 0:
+            return 0.0
+        return self.forced_decisions / self.decisions
 
     def clear(self) -> None:
         self.transitions.clear()

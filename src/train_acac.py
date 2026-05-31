@@ -19,9 +19,9 @@ def main() -> None:
     parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--eval-seed", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--arrival-rate", type=float, default=0.5)
+    parser.add_argument("--arrival-rate", type=float, default=1.0)
     parser.add_argument("--episode-time", type=float, default=80.0)
-    parser.add_argument("--max-tasks", type=int, default=32)
+    parser.add_argument("--max-tasks", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/acac_p2e2"))
@@ -105,7 +105,8 @@ def main() -> None:
                 "completed={completed}/{total} throughput={throughput:.3f} "
                 "turnaround={turnaround} loss={loss:.3f} value_loss={value_loss:.3f} "
                 "entropy={entropy:.3f} kl={kl:.4f} clip_frac={clip_fraction:.3f} "
-                "conflicts={conflicts} eval_reward={eval_reward:.3f} "
+                "conflicts={conflicts} choices={choices:.2f} forced={forced:.2f} "
+                "eval_reward={eval_reward:.3f} "
                 "eval_completed={eval_completed:.1f} eas_reward={eas_reward:.3f}".format(
                     episode=episode_idx,
                     transitions=len(rollout),
@@ -120,6 +121,8 @@ def main() -> None:
                     kl=stats.approx_kl,
                     clip_fraction=stats.clip_fraction,
                     conflicts=rollout.conflicts,
+                    choices=rollout.mean_task_choices,
+                    forced=rollout.forced_decision_fraction,
                     eval_reward=eval_summary["reward"],
                     eval_completed=eval_summary["completed"],
                     eas_reward=eval_summary["baselines"]["eas_like"]["reward"],
@@ -237,6 +240,10 @@ def build_log_row(
         "env_steps": rollout.env_steps,
         "conflicts": rollout.conflicts,
         "invalid_actions": rollout.invalid_actions,
+        "decisions": rollout.decisions,
+        "mean_task_choices": rollout.mean_task_choices,
+        "max_task_choices": rollout.max_task_choices,
+        "forced_decision_fraction": rollout.forced_decision_fraction,
         "reward": total_reward,
         "mean_elapsed_time": float(np.mean(elapsed_times)),
         "metrics": metrics.as_dict(),

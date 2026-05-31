@@ -42,6 +42,12 @@ def collect_episode(
 
         for agent_id in batch.decision_agent_ids():
             agent_index = batch.agent_ids.index(agent_id)
+            task_choices = int(batch.action_mask[agent_index, 1:].sum())
+            buffer.decisions += 1
+            buffer.total_task_choices += task_choices
+            buffer.max_task_choices = max(buffer.max_task_choices, task_choices)
+            if task_choices <= 1:
+                buffer.forced_decisions += 1
             action = int(chosen_actions.get(agent_id, 0))
             if action == 0:
                 continue
