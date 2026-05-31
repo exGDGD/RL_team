@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 from argparse import Namespace
+from dataclasses import replace
 from pathlib import Path
 
 torch = pytest.importorskip("torch")
@@ -70,6 +71,32 @@ def test_torch_acac_policy_can_update_from_collected_rollout() -> None:
     assert np.isfinite(stats.loss)
     assert np.isfinite(stats.policy_loss)
     assert np.isfinite(stats.value_loss)
+
+
+def test_compute_advantages_does_not_cross_episode_boundaries() -> None:
+    env = SchedulerEnv(
+        core_config={CoreType.P: 1},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=0.5,
+        episode_time=30.0,
+        max_tasks=2,
+        seed=3,
+    )
+    transition = collect_episode(env, FirstValidPolicy(), seed=3).transitions[0]
+    transitions = [
+        replace(transition, episode_id=0, reward=1.0, terminated=False),
+        replace(transition, episode_id=1, reward=2.0, terminated=False),
+    ]
+
+    advantages, _ = compute_advantages(
+        transitions=transitions,
+        values=np.zeros(2, dtype=np.float32),
+        next_values=np.zeros(2, dtype=np.float32),
+        gamma=0.5,
+        gae_lambda=1.0,
+    )
+
+    assert advantages.tolist() == pytest.approx([1.0, 2.0])
 
 
 def test_checkpoint_and_jsonl_log_can_be_written(tmp_path: Path) -> None:

@@ -1,5 +1,5 @@
 from src.env import CoreType, SchedulerEnv, WorkloadScenario
-from src.rl import AgentBatch, collect_episode
+from src.rl import AgentBatch, RolloutBuffer, collect_episode
 from src.rl.rollout import _discard_rejected_decisions
 
 
@@ -68,3 +68,20 @@ def test_rejected_conflict_decision_is_removed_from_pending() -> None:
     )
 
     assert set(pending) == {"p_0"}
+
+
+def test_combined_rollouts_receive_distinct_episode_ids() -> None:
+    combined = RolloutBuffer()
+    for seed in (3, 4):
+        env = SchedulerEnv(
+            core_config={CoreType.P: 1},
+            workload_scenario=WorkloadScenario.BALANCED,
+            arrival_rate=0.5,
+            episode_time=30.0,
+            max_tasks=4,
+            seed=seed,
+        )
+        combined.extend(collect_episode(env, FirstValidPolicy(), seed=seed))
+
+    assert combined.episodes == 2
+    assert {transition.episode_id for transition in combined.transitions} == {0, 1}

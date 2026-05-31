@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -25,6 +25,7 @@ class AgentTransition:
     """One agent-centric transition for asynchronous actor-critic updates."""
 
     agent_id: str
+    episode_id: int
     agent_index: int
     obs: AgentBatch
     action: int
@@ -41,6 +42,7 @@ class AgentTransition:
 @dataclass
 class RolloutBuffer:
     transitions: list[AgentTransition] = field(default_factory=list)
+    episodes: int = 0
     env_steps: int = 0
     conflicts: int = 0
     invalid_actions: int = 0
@@ -53,7 +55,14 @@ class RolloutBuffer:
         self.transitions.append(transition)
 
     def extend(self, other: RolloutBuffer) -> None:
-        self.transitions.extend(other.transitions)
+        self.transitions.extend(
+            replace(
+                transition,
+                episode_id=transition.episode_id + self.episodes,
+            )
+            for transition in other.transitions
+        )
+        self.episodes += other.episodes
         self.env_steps += other.env_steps
         self.conflicts += other.conflicts
         self.invalid_actions += other.invalid_actions

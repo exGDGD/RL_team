@@ -25,10 +25,12 @@ def main() -> None:
     parser.add_argument("--max-tasks", type=int, default=64)
     parser.add_argument("--lambda-energy", type=float, default=0.1)
     parser.add_argument("--lambda-starvation", type=float, default=0.05)
-    parser.add_argument("--lambda-latency", type=float, default=0.1)
+    parser.add_argument("--lambda-latency", type=float, default=0.5)
     parser.add_argument("--starvation-max-wait-weight", type=float, default=0.5)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--reward-scale", type=float, default=0.01)
+    parser.add_argument("--actor-learning-rate", type=float, default=1.0e-3)
+    parser.add_argument("--critic-learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/acac_p2e2"))
     parser.add_argument("--save-every", type=int, default=10)
@@ -56,6 +58,8 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         allow_noop=False,
         reward_scale=args.reward_scale,
+        actor_learning_rate=args.actor_learning_rate,
+        critic_learning_rate=args.critic_learning_rate,
     )
     policy = TorchACACPolicy(config, device=args.device)
     trainer = ACACTrainer(policy)
@@ -129,6 +133,7 @@ def main() -> None:
                 "turnaround={turnaround} loss={loss:.3f} value_loss={value_loss:.3f} "
                 "entropy={entropy:.3f} kl={kl:.4f} clip_frac={clip_fraction:.3f} "
                 "actor_grad={actor_grad:.3f} critic_grad={critic_grad:.3f} "
+                "adv_std={adv_std:.3f} "
                 "conflicts={conflicts} choices={choices:.2f} forced={forced:.2f} "
                 "eval_reward={eval_reward:.3f} "
                 "eval_completed={eval_completed:.1f} random_reward={random_reward:.3f} "
@@ -147,6 +152,7 @@ def main() -> None:
                     clip_fraction=stats.clip_fraction,
                     actor_grad=stats.actor_grad_norm,
                     critic_grad=stats.critic_grad_norm,
+                    adv_std=stats.advantage_std,
                     conflicts=rollout.conflicts,
                     choices=rollout.mean_task_choices,
                     forced=rollout.forced_decision_fraction,
@@ -201,7 +207,7 @@ def reward_weights_from_args(args: argparse.Namespace) -> RewardWeights:
     return RewardWeights(
         energy=getattr(args, "lambda_energy", 0.1),
         starvation=getattr(args, "lambda_starvation", 0.05),
-        latency=getattr(args, "lambda_latency", 0.1),
+        latency=getattr(args, "lambda_latency", 0.5),
         starvation_max_wait_weight=getattr(args, "starvation_max_wait_weight", 0.5),
     )
 

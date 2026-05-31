@@ -33,7 +33,7 @@ def collect_episode(
     observations, info = env.reset(seed=seed)
     batch = build_agent_batch(observations, agent_order=env.agents)
     pending: dict[str, PendingDecision] = {}
-    buffer = RolloutBuffer()
+    buffer = RolloutBuffer(episodes=1)
 
     for _ in range(max_env_steps):
         actions = {agent_id: 0 for agent_id in env.agents}
@@ -148,6 +148,7 @@ def _close_finished_decisions(
         buffer.append(
             AgentTransition(
                 agent_id=agent_id,
+                episode_id=0,
                 agent_index=decision.agent_index,
                 obs=decision.obs,
                 action=decision.action,

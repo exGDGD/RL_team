@@ -144,16 +144,18 @@ python -m src.train_acac --episodes 100 --eval-every 10
 ```bash
 python -m src.train_acac \
   --rollout-episodes 4 \
-  --reward-scale 0.01
+  --reward-scale 0.01 \
+  --actor-learning-rate 0.001 \
+  --critic-learning-rate 0.0003
 ```
 
-Energy와 latency cost는 물리적으로 해석 가능한 raw 값을 유지하고 lambda로 trade-off를 조정합니다. Starvation cost는 queue 길이와 긴 대기시간 때문에 폭발하지 않도록 `mean(log1p(wait)) + beta * max(log1p(wait))`에 burst 실행 시간을 곱합니다. 초기 sanity training 값은 `energy=0.1`, `starvation=0.05`, `latency=0.1`, `beta=0.5`입니다.
+Energy와 latency cost는 물리적으로 해석 가능한 raw 값을 유지하고 lambda로 trade-off를 조정합니다. Starvation cost는 queue 길이와 긴 대기시간 때문에 폭발하지 않도록 `mean(log1p(wait)) + beta * max(log1p(wait))`에 burst 실행 시간을 곱합니다. 초기 sanity training은 정책 차이가 충분히 보이도록 `energy=0.1`, `starvation=0.05`, `latency=0.5`, `beta=0.5`를 사용합니다.
 
 ```bash
 python -m src.train_acac \
   --lambda-energy 0.1 \
   --lambda-starvation 0.05 \
-  --lambda-latency 0.1 \
+  --lambda-latency 0.5 \
   --starvation-max-wait-weight 0.5
 ```
 

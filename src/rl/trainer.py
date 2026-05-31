@@ -24,7 +24,8 @@ class ACACConfig:
     value_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
-    learning_rate: float = 3.0e-4
+    actor_learning_rate: float = 1.0e-3
+    critic_learning_rate: float = 3.0e-4
     allow_noop: bool = False
     update_epochs: int = 4
     reward_scale: float = 0.01
@@ -40,6 +41,9 @@ class UpdateStats:
     clip_fraction: float
     actor_grad_norm: float
     critic_grad_norm: float
+    advantage_mean: float
+    advantage_std: float
+    return_mean: float
 
 
 class TorchACACPolicy(nn.Module):
@@ -173,8 +177,16 @@ class ACACTrainer:
         self.policy = policy
         self.config = policy.config
         self.optimizer = optimizer or torch.optim.Adam(
-            policy.parameters(),
-            lr=self.config.learning_rate,
+            [
+                {
+                    "params": policy.actors.parameters(),
+                    "lr": self.config.actor_learning_rate,
+                },
+                {
+                    "params": policy.critic.parameters(),
+                    "lr": self.config.critic_learning_rate,
+                },
+            ]
         )
 
     def update(self, rollout: RolloutBuffer) -> UpdateStats:
@@ -266,6 +278,9 @@ class ACACTrainer:
             clip_fraction=float(means[5]),
             actor_grad_norm=float(means[6]),
             critic_grad_norm=float(means[7]),
+            advantage_mean=float(np.mean(advantages)),
+            advantage_std=float(np.std(advantages)),
+            return_mean=float(np.mean(returns)),
         )
 
 
@@ -281,9 +296,10 @@ def compute_advantages(
     advantages = np.zeros(len(transitions), dtype=np.float32)
     returns = np.zeros(len(transitions), dtype=np.float32)
 
-    by_agent: dict[str, list[int]] = {}
+    by_agent: dict[tuple[int, str], list[int]] = {}
     for idx, transition in enumerate(transitions):
-        by_agent.setdefault(transition.agent_id, []).append(idx)
+        key = (transition.episode_id, transition.agent_id)
+        by_agent.setdefault(key, []).append(idx)
 
     rewards = np.array(
         [transition.reward * reward_scale for transition in transitions],
