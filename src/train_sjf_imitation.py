@@ -8,6 +8,7 @@ import numpy as np
 
 from src.rl import collect_sjf_examples
 from src.train_acac import evaluate_policy, make_env, serialize_args
+from src.train_logging import configure_logging, get_logger
 
 
 IMITATION_CHECKPOINT_VERSION = "sjf_actor_imitation_v1"
@@ -42,6 +43,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    logger = configure_logging(args.output.parent)
+
     try:
         import torch
         import torch.nn.functional as F
@@ -75,10 +78,10 @@ def main() -> None:
     if not train_examples or not validation_examples:
         raise SystemExit("SJF imitation dataset is empty. Increase workload density.")
 
-    print(
-        "SJF actor imitation "
-        f"train_examples={len(train_examples)} "
-        f"validation_examples={len(validation_examples)}"
+    logger.info(
+        "SJF actor imitation | train_examples=%d validation_examples=%d",
+        len(train_examples),
+        len(validation_examples),
     )
     for epoch in range(1, args.epochs + 1):
         loss = train_epoch(
@@ -92,10 +95,12 @@ def main() -> None:
         )
         train_accuracy = imitation_accuracy(policy, train_examples, torch=torch)
         validation_accuracy = imitation_accuracy(policy, validation_examples, torch=torch)
-        print(
-            f"epoch={epoch} loss={loss:.4f} "
-            f"train_accuracy={train_accuracy:.3f} "
-            f"validation_accuracy={validation_accuracy:.3f}"
+        logger.info(
+            "epoch %3d | loss %.4f | acc train %.3f  val %.3f",
+            epoch,
+            loss,
+            train_accuracy,
+            validation_accuracy,
         )
 
     summary = evaluate_policy(
@@ -121,11 +126,12 @@ def main() -> None:
         },
         args.output,
     )
-    print(
-        f"saved actors={args.output} "
-        f"eval_reward={summary['reward']:.3f} "
-        f"sampled_eval_reward={summary['sampled']['reward']:.3f} "
-        f"sjf_reward={summary['baselines']['sjf_like']['reward']:.3f}"
+    logger.info(
+        "saved actors=%s | eval_reward %+.3f (sampled %+.3f) | sjf %+.3f",
+        args.output,
+        summary["reward"],
+        summary["sampled"]["reward"],
+        summary["baselines"]["sjf_like"]["reward"],
     )
 
 

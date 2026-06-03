@@ -1,8 +1,12 @@
 # RL Team
 
-Heterogeneous CPU scheduling을 위한 multi-agent reinforcement learning 실험 repo입니다.
+성능–효율 비대칭(heterogeneous) CPU 코어가 혼합된 환경에서 "어떤 태스크를 어느 코어에 보낼지"를 결정하는 스케줄러를 비동기 multi-agent reinforcement learning으로 학습하는 실험 repo입니다.
 
-초기 구현 목표는 SimPy 기반 이산 이벤트 시뮬레이터를 만들고, PettingZoo multi-agent API로 감싸서 학습/평가 코드와 연결하는 것입니다.
+- **알고리즘:** ACAC (Agent-Centric Actor-Critic for Asynchronous MARL, ICML 2025). 1 core = 1 agent, 코어 타입별 정책 파라미터 공유.
+- **장기 목표:** 한 번 학습한 정책이 다양한 코어 구성(P2E2, P1E3, P3E1…)에 zero-shot으로 작동하는 scalability. 이를 위해 domain randomization과 12 코어구성 × 5 워크로드 grid 평가를 계획합니다.
+- **현재 상태:** SimPy 기반 이산 이벤트 시뮬레이터 + baseline 4종 + 단일 구성(P2E2) ACAC sanity 학습까지 구현된 단계입니다. domain randomization·평가 grid·replay trace는 미구현입니다.
+
+설계 동기·환경 설계·검증 방법의 전체 맥락은 [`docs/teamplo-design-doc.md`](docs/teamplo-design-doc.md)에 정리되어 있습니다. 초기 구현 목표는 SimPy 시뮬레이터를 만들고 PettingZoo multi-agent API로 감싸 학습/평가 코드와 연결하는 것입니다.
 
 ## Environment Setup
 
@@ -49,21 +53,47 @@ python -m pip install -r requirements.txt
 - `gymnasium.spaces`: observation/action space 정의
 - `numpy`: state/reward/metric 계산
 - `pytest`: 환경 동작 단위 테스트
+- `torch`: actor/critic 학습 (requirements에는 없으며 Colab에서만 설치·실행)
+
+## Heterogeneous Core Architecture
+
+`src/env/core.py`의 `CORE_SPECS`는 4종 코어를 정의합니다. 실행시간은 `Δt = B_base / speed × α_mismatch`로 계산하고, mismatch penalty(`SchedulerEnv._mismatch_penalty`)는 HARD-RT 태스크의 E/LP-E 배정(×1.4), 고-intensity 태스크의 LP-E 배정(×1.5), 저-intensity 태스크의 Prime/P 배정(×1.15)에 적용됩니다.
+
+| Core Type | 처리속도 배율 | 전력 계수 | Context-Switch 비용 | 주 용도 |
+|---|---|---|---|---|
+| Prime-Core | 4.0× | 8.0 | 1.5 | 단일 스레드 최고 성능 |
+| P-Core | 3.0× | 5.0 | 1.0 | 헤비 병렬 연산 |
+| E-Core | 1.5× | 1.5 | 0.3 | I/O, 인터럽트 |
+| LP-E Core | 0.8× | 0.4 | 0.2 | 백그라운드 장기 태스크 |
+
+기본 코어 구성은 **P2E2**(`DEFAULT_CORE_CONFIG = {P: 2, E: 2}`)입니다. Prime/LP-E는 스펙만 정의되어 있고 기본 학습/테스트에는 포함하지 않습니다.
 
 ## Current Structure
 
 ```text
-src/env/
-  core.py           # heterogeneous core specs and runtime state
-  metrics.py        # throughput, energy, latency, starvation, utilization metrics
-  spaces.py         # Gymnasium observation/action space definitions
-  task.py           # task phases, latency class, progress tracking
-  workload.py       # stochastic task generator
-  scheduler_env.py  # first-pass SimPy event-driven scheduler env
-tests/
-  test_baselines.py
-  test_metrics.py
-  test_scheduler_env.py
+src/
+  env/
+    core.py           # heterogeneous core specs and runtime state
+    task.py           # multi-phase task (cpu_bursts/io_waits), latency class, progress
+    workload.py       # stochastic task generator (scenario-conditioned)
+    metrics.py        # throughput, energy, latency, starvation, utilization metrics
+    spaces.py         # Gymnasium observation/action space definitions
+    scheduler_env.py  # SimPy event-driven scheduler env (global ready queue)
+  baselines/
+    policies.py       # Random / RoundRobin / SJF-like / EAS-like
+    runner.py         # baseline episode runner
+  rl/
+    obs.py            # observation tensor encoding
+    networks.py       # TypeSharedActor + AgentCentricCritic (attention)
+    buffer.py         # RolloutBuffer + joint macro-timeline transitions, time-scaled GAE
+    rollout.py        # async episode collection
+    trainer.py        # ACAC/PPO update step
+    imitation.py      # SJF example collection for warm-start
+  evaluate_baselines.py  # multi-seed baseline comparison
+  train_acac.py          # single-config (P2E2) ACAC sanity training entrypoint
+  train_sjf_imitation.py # SJF actor warm-start
+  train_logging.py       # human-readable console/file training logs
+tests/                    # test_baselines, test_metrics, test_scheduler_env, test_rl_*, test_train_acac
 ```
 
 현재 `SchedulerEnv`는 PettingZoo `ParallelEnv`와 비슷한 dict 기반 입출력을 반환합니다. 정식 PettingZoo wrapper는 core simulator가 안정화된 뒤 얹을 예정입니다.
@@ -184,9 +214,9 @@ python -m src.train_acac \
   --starvation-max-wait-weight 0.5
 ```
 
-학습 중 `outputs/acac_p2e2/metrics.jsonl`, `latest.pt`, `best.pt`가 생성됩니다. Colab 런타임 종료 후에도 보존하려면 `--output-dir`에 Google Drive 경로를 넘깁니다. 중단된 학습은 다음처럼 이어서 실행합니다.
+학습 중 `outputs/acac_p2e2/`에 `metrics.jsonl`, `train.log`, `latest.pt`, `best.pt`가 생성됩니다. Colab 런타임 종료 후에도 보존하려면 `--output-dir`에 Google Drive 경로를 넘깁니다. 중단된 학습은 다음처럼 이어서 실행합니다.
 
-콘솔의 `eval_reward`는 argmax action을 쓰는 deterministic 평가이고, `sampled_eval_reward`는 현재 확률 정책에서 action을 sampling한 평가입니다. 학습 초반에는 entropy가 높으므로 random baseline과 비교할 때 `sampled_eval_reward`도 함께 확인합니다. `metrics.jsonl`에는 queue slot과 선택된 task 특성 요약도 기록됩니다.
+로그는 두 갈래로 나뉩니다. `metrics.jsonl`은 episode별 전체 지표를 담는 기계 판독용 구조화 기록이고, 콘솔과 `train.log`(`src/train_logging.py`)는 사람이 한눈에 훑기 위한 요약입니다. 매 episode `ep ... | reward ... | loss ...` 한 줄이 찍히고, 평가 episode에서는 그 아래로 `eval`(deterministic / sampled reward)과 `base`(random/sjf/eas baseline) 블록이 들여쓰여 추가됩니다. eval 줄의 `reward`는 argmax action을 쓰는 deterministic 평가, 괄호 안 `sampled`는 현재 확률 정책에서 action을 sampling한 평가입니다. 학습 초반에는 entropy가 높으므로 random baseline과 비교할 때 `sampled`도 함께 확인합니다.
 
 ```bash
 python -m src.train_acac \

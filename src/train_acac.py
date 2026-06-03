@@ -11,6 +11,12 @@ import numpy as np
 
 from src.env import CoreType, RewardWeights, SchedulerEnv, WorkloadScenario
 from src.rl import RolloutBuffer, collect_episode
+from src.train_logging import (
+    configure_logging,
+    get_logger,
+    log_episode_eval,
+    log_episode_train,
+)
 
 
 CHECKPOINT_VERSION = "learnable_actor_filter_v1"
@@ -58,6 +64,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    logger = configure_logging(args.output_dir)
+
     try:
         import torch
 
@@ -88,7 +96,7 @@ def main() -> None:
             weights_only=False,
         )
         policy.actors.load_state_dict(checkpoint["actors_state_dict"])
-        print(f"loaded pretrained actors={args.pretrained_actors}")
+        logger.info("loaded pretrained actors=%s", args.pretrained_actors)
     trainer = ACACTrainer(policy)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "metrics.jsonl"
@@ -104,11 +112,16 @@ def main() -> None:
         trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_episode = int(checkpoint["episode"]) + 1
         best_eval_reward = float(checkpoint.get("best_eval_reward", float("-inf")))
-        print(f"resumed checkpoint={args.resume} next_episode={start_episode}")
+        logger.info(
+            "resumed checkpoint=%s next_episode=%d", args.resume, start_episode
+        )
 
-    print("ACAC single-config sanity training")
-    print({"config": asdict(config), "args": vars(args)})
-    print(f"logs={metrics_path} latest={latest_path} best={best_path}")
+    logger.info("=== ACAC single-config sanity training ===")
+    logger.info("config: %s", asdict(config))
+    logger.info("args: %s", vars(args))
+    logger.info(
+        "logs=%s latest=%s best=%s", metrics_path, latest_path, best_path
+    )
 
     for episode_idx in range(start_episode, args.episodes + 1):
         rollout = RolloutBuffer()
@@ -130,7 +143,7 @@ def main() -> None:
                 )
             )
         if len(rollout) == 0:
-            print(f"episode={episode_idx} skipped empty rollout")
+            logger.warning("ep %d skipped empty rollout", episode_idx)
             continue
 
         assert env is not None
@@ -158,57 +171,16 @@ def main() -> None:
         )
         append_jsonl(metrics_path, log_row)
 
+        log_episode_train(
+            episode_idx=episode_idx,
+            total_reward=total_reward,
+            rollout=rollout,
+            metrics=metrics,
+            stats=stats,
+        )
+
         if eval_summary is not None:
-            print(
-                "episode={episode} transitions={transitions} actor_samples={actor_samples} "
-                "joints={joints} reward={reward:.3f} "
-                "completed={completed}/{total} throughput={throughput:.3f} "
-                "turnaround={turnaround} loss={loss:.3f} policy_loss={policy_loss:.4f} "
-                "value_loss={value_loss:.3f} entropy={entropy:.3f} "
-                "norm_entropy={norm_entropy:.3f} kl={kl:.4f} "
-                "ratio_std={ratio_std:.4f} ratio_max={ratio_max:.4f} "
-                "clip_frac={clip_fraction:.3f} "
-                "actor_grad={actor_grad:.3f} critic_grad={critic_grad:.3f} "
-                "adv_std={adv_std:.3f} "
-                "conflicts={conflicts} choices={choices:.2f} forced={forced:.2f} "
-                "eval_reward={eval_reward:.3f} sampled_eval_reward={sampled_eval_reward:.3f} "
-                "eval_first={eval_first:.2f} sampled_first={sampled_first:.2f} "
-                "eval_completed={eval_completed:.1f} random_reward={random_reward:.3f} "
-                "sjf_reward={sjf_reward:.3f} eas_reward={eas_reward:.3f}".format(
-                    episode=episode_idx,
-                    transitions=len(rollout),
-                    actor_samples=stats.actor_samples,
-                    joints=len(rollout.joint_transitions),
-                    reward=total_reward,
-                    completed=metrics.completed_tasks,
-                    total=metrics.total_tasks,
-                    throughput=metrics.throughput,
-                    turnaround=_fmt(metrics.mean_turnaround_time),
-                    loss=stats.loss,
-                    policy_loss=stats.policy_loss,
-                    value_loss=stats.value_loss,
-                    entropy=stats.entropy,
-                    norm_entropy=stats.normalized_entropy,
-                    kl=stats.approx_kl,
-                    ratio_std=stats.ratio_std,
-                    ratio_max=stats.ratio_max_deviation,
-                    clip_fraction=stats.clip_fraction,
-                    actor_grad=stats.actor_grad_norm,
-                    critic_grad=stats.critic_grad_norm,
-                    adv_std=stats.advantage_std,
-                    conflicts=rollout.conflicts,
-                    choices=rollout.mean_task_choices,
-                    forced=rollout.forced_decision_fraction,
-                    eval_reward=eval_summary["reward"],
-                    sampled_eval_reward=eval_summary["sampled"]["reward"],
-                    eval_first=eval_summary["actions"]["first_slot_fraction"],
-                    sampled_first=eval_summary["sampled"]["actions"]["first_slot_fraction"],
-                    eval_completed=eval_summary["completed"],
-                    random_reward=eval_summary["baselines"]["random"]["reward"],
-                    sjf_reward=eval_summary["baselines"]["sjf_like"]["reward"],
-                    eas_reward=eval_summary["baselines"]["eas_like"]["reward"],
-                )
-            )
+            log_episode_eval(eval_summary)
             if eval_summary["reward"] > best_eval_reward:
                 best_eval_reward = eval_summary["reward"]
                 save_checkpoint(
@@ -488,7 +460,7 @@ def save_checkpoint(
     temp_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(checkpoint, temp_path)
     temp_path.replace(path)
-    print(f"saved checkpoint={path} episode={episode_idx}")
+    get_logger().info("saved checkpoint=%s episode=%d", path, episode_idx)
 
 
 def validate_checkpoint_version(checkpoint: dict[str, Any]) -> None:
@@ -515,12 +487,6 @@ class EvaluationPolicy:
 
     def act(self, batch):
         return self.policy.act(batch, deterministic=self.deterministic)
-
-
-def _fmt(value: float | None) -> str:
-    if value is None:
-        return "-"
-    return f"{value:.3f}"
 
 
 if __name__ == "__main__":
