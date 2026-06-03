@@ -356,8 +356,6 @@ def summarize_rollout_actions(rollout: RolloutBuffer) -> dict[str, float]:
             "mean_selected_progress": 0.0,
             "mean_selected_latency": 0.0,
             "mean_selected_cpu_intensity": 0.0,
-            "mean_selected_current_burst": 0.0,
-            "mean_selected_remaining_work": 0.0,
         }
 
     actions = np.asarray([transition.action for transition in rollout.transitions])
@@ -383,8 +381,6 @@ def summarize_rollout_actions(rollout: RolloutBuffer) -> dict[str, float]:
         "mean_selected_progress": float(np.mean(selected_tasks[:, 1])),
         "mean_selected_latency": float(np.mean(selected_tasks[:, 2])),
         "mean_selected_cpu_intensity": float(np.mean(selected_tasks[:, 3])),
-        "mean_selected_current_burst": float(np.mean(selected_tasks[:, 4])),
-        "mean_selected_remaining_work": float(np.mean(selected_tasks[:, 5])),
     }
 
 

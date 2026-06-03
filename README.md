@@ -116,16 +116,18 @@ tests/                    # test_baselines, test_metrics, test_scheduler_env, te
 
 ## Observation and Action Space
 
-`SchedulerEnv.action_space(agent_id)`는 `Discrete(queue_size + 1)`입니다. `0`은 NO-OP이고, `1..queue_size`는 ready queue slot 선택입니다.
+`SchedulerEnv.action_space(agent_id)`는 `Discrete(queue_size + 1)`입니다. `0`은 "변화 없음"(idle이면 NO-OP/대기, busy이면 현재 task 유지)이고, `1..queue_size`는 ready queue slot 선택입니다. 선점이 켜져 있으면 busy core가 slot을 고르면 현재 task를 preempt하고 그 slot으로 전환합니다.
 
 `SchedulerEnv.observation_space(agent_id)`는 다음 key를 가진 `gymnasium.spaces.Dict`입니다.
 
-- `self`: `(5,)` core type, busy flag, current task elapsed time, accumulated energy, time since last decision
-- `ready_queue`: `(queue_size, 6)` waiting time, CPU progress, latency class, CPU intensity, current CPU burst, remaining CPU work
+- `self`: `(8,)` core type, busy flag, current task elapsed time, accumulated energy, time since last decision, running task latency class, running task CPU intensity, running task CPU progress
+- `ready_queue`: `(queue_size, 4)` waiting time, CPU progress, latency class, CPU intensity (정확한 burst 길이는 SJF 정답지화를 막기 위해 노출하지 않음)
 - `ready_mask`: `(queue_size,)`
 - `other_cores`: `(num_cores - 1, 3)` core type, busy flag, current task elapsed time
 - `system`: `(6,)` total core count, utilization, 4-way core type counts
 - `action_mask`: `(queue_size + 1,)`
+
+> **선점(preemption):** `enable_preemption=True`(학습 기본값)이면 wakeup(arrival/IO 완료) 시 우선순위(P1)·기아(P3) 게이트를 통과한 busy core도 decision point를 받아 현재 task를 멈추고 다른 task로 전환할 수 있습니다(부분 burst 재큐잉 + 코어별 context-switch 비용). 비선점 ablation은 `--disable-preemption`. 자세한 설계는 [`docs/preemption-design.md`](docs/preemption-design.md).
 
 ## Metrics
 

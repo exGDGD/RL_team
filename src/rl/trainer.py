@@ -461,9 +461,9 @@ def normalize_observation_tensors(
     tensors["self_features"] = self_features
 
     ready_queue = tensors["ready_queue"].clone()
+    # [waiting_time, cpu_progress, latency_class, cpu_intensity]
     ready_queue[:, :, 0:2] = torch.log1p(ready_queue[:, :, 0:2])
     ready_queue[:, :, 2] = ready_queue[:, :, 2] / 2.0
-    ready_queue[:, :, 4:6] = torch.log1p(ready_queue[:, :, 4:6])
     tensors["ready_queue"] = ready_queue
 
     other_cores = tensors["other_cores"].clone()

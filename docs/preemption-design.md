@@ -1,12 +1,12 @@
 # Preemption 설계 스펙 (6/3 패치 item 3 구체화)
 
-> **상태:** 구현 완료 (env 기반 + RL 활성화). item 1(obs burst 제거)만 남음.
+> **상태:** 구현 완료 (item 1 + 2 + 3 전체).
 >
 > **구현 상태 (2026-06-03):**
 > - ✅ env 기반: 부분 burst, preempt 기계, P1/P3+min_run 게이트, CS 비용, self 8-dim, force_progress (`enable_preemption` 플래그)
 > - ✅ RL 활성화: `obs.decision_mask=has_task_action`, rollout preempt transition(닫고-열기 + 동일 step 완료 처리) + idle NO-OP 기록(item 2), `allow_noop=True`, `train_acac --disable-preemption`(기본 on)
-> - ✅ 검증: runnable 테스트 43 passed (preemption 발생·credit 일관성·NO-OP 기록 포함). torch 네트워크 테스트 2개는 미설치로 skip — `rl-team`에서 확인 필요.
-> - ⬜ item 1: ready_queue 6→4 (burst 정답지 제거) — 다음 단계
+> - ✅ item 1: ready_queue 6→4 (`current_cpu_burst`/`remaining_cpu_work` 제거 — SJF 정답지 비노출). spaces/env/normalize/summarize + 테스트 갱신, burst-노출 테스트 삭제.
+> - ✅ 검증: runnable 테스트 42 passed (preemption 발생·credit 일관성·NO-OP 기록 포함). torch 네트워크 테스트 2개는 미설치로 skip — `rl-team`에서 확인 필요.
 > **선행 논의:** teamplo 6/3 패치 — item 1(obs에서 burst 제거)·item 2(NO-OP 활성)·item 3(preemption+CS 비용)
 > **결정된 순서:** preemption(+NO-OP)을 **먼저** 구현 → 그다음 obs burst 제거(item 1).
 > 이유: burst를 먼저 빼면 "obs 불확실 + 복구 불가"가 겹쳐 중간 단계 에이전트가 최악이 됨. preemption이 "돌려보고 고치는" 복구 메커니즘을 먼저 제공해야 함.
@@ -104,7 +104,7 @@ busy 코어가 keep-vs-preempt를 판단하려면 자기 task를 봐야 한다. 
 | key | shape | 비고 |
 |---|---|---|
 | `self` | (8,) | ← 본 변경 |
-| `ready_queue` | (K, 6) | item 1에서 (K, 4)로 축소 예정 |
+| `ready_queue` | (K, 4) | ✅ item 1 완료 — `current_cpu_burst`/`remaining_cpu_work` 제거 |
 | `ready_mask` | (K,) | |
 | `other_cores` | (N-1, 3) | 변경 없음 |
 | `system` | (6,) | 변경 없음 |
@@ -151,12 +151,12 @@ switch 시 코어 타입별 CS 비용(core spec: Prime 1.5 / P 1.0 / E 0.3 / LP-
 
 ## 8. 검증 한계
 
-로컬 셸에 numpy/torch/pytest 없음(`rl-team` conda env 미접근) → **학습 경로를 로컬에서 못 돌림.** `py_compile` + env 단위 추론으로만 검증 가능. 최종 검증은 `rl-team`에서 `pytest -q` 필요.
+임시 venv(numpy/simpy/gymnasium/pytest, torch 제외)로 **runnable 테스트 42 passed** 직접 확인(preemption 발생·credit 일관성·NO-OP 기록·obs 4-dim 포함). `torch` 미설치라 네트워크 forward 2개(`test_rl_networks`)와 policy.act `allow_noop` 마스킹·self/ready_queue 정규화 torch 경로는 미검증 — `rl-team`(또는 Colab 노트북 8장)에서 `pytest -q` 필요.
 
 ---
 
-## 9. 이후 단계: item 1 (obs에서 burst 제거)
+## 9. item 1 — obs에서 burst 제거 (✅ 완료)
 
-위 preemption이 자리 잡은 뒤 진행:
-- `ready_queue` 6→4: `current_cpu_burst`·`remaining_cpu_work` 제거(`scheduler_env._observe_agent`, `spaces.READY_TASK_FEATURE_DIM`, `trainer.normalize_observation_tensors`의 4:6 log1p, `train_acac.summarize_rollout_actions`의 두 키, 관련 테스트).
-- 이 시점엔 preemption이 복구 메커니즘을 제공하므로 "정답지 제거"가 안전.
+- `ready_queue` 6→4: `current_cpu_burst`·`remaining_cpu_work` 제거. 변경: `scheduler_env._observe_agent`, `spaces.READY_TASK_FEATURE_DIM`/Box, `trainer.normalize_observation_tensors`(4:6 log1p 라인 삭제), `train_acac.summarize_rollout_actions`(두 키 삭제), 테스트 shape 갱신, `test_sjf_examples_expose_current_and_remaining_cpu_work` 삭제.
+- env/task 내부의 burst는 그대로 사용(run_time·부분 work 계산) — **obs 노출만 제거**. SJF imitation은 내부 task 상태로 라벨을 만들므로 그대로 동작(이제 4-dim obs로 SJF를 추정 학습).
+- preemption이 "돌려보고 고치는" 복구 메커니즘을 제공하므로 정답지 제거가 안전.
