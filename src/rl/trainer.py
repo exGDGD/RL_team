@@ -15,7 +15,7 @@ from .buffer import (
     RolloutBuffer,
     compute_time_scaled_gae,
 )
-from .networks import AgentCentricCritic, TypeSharedActor
+from .networks import AgentCentricCritic, TypeSharedActor, mask_logits
 from .obs import AgentBatch
 
 
@@ -90,27 +90,59 @@ class TorchACACPolicy(nn.Module):
         effective_masks: dict[str, np.ndarray] = {}
         claimed_slots: set[int] = set()
 
-        with torch.no_grad():
-            for row, agent_id in enumerate(batch.agent_ids):
-                if not bool(batch.decision_mask[row]):
-                    continue
+        decision_rows = [
+            row
+            for row in range(len(batch.agent_ids))
+            if bool(batch.decision_mask[row])
+        ]
+        if not decision_rows:
+            return actions, log_probs, effective_masks
 
+        with torch.no_grad():
+            # Forward pass batched per core type (one call per type instead of
+            # one per core). The action logits do not depend on claimed_slots,
+            # so they are computed up front; only the cheap mask+sample step
+            # below stays sequential to preserve the exact claimed-slot logic
+            # and RNG draw order of the unbatched implementation.
+            raw_logits: dict[int, torch.Tensor] = {}
+            base_masks: dict[int, torch.Tensor] = {}
+            rows_by_type: dict[CoreType, list[int]] = {}
+            for row in decision_rows:
                 core_type = list(CoreType)[int(batch.core_type_indices[row])]
-                tensors = batch_rows_to_tensors(batch, [row], self.device)
+                rows_by_type.setdefault(core_type, []).append(row)
+            for core_type, rows in rows_by_type.items():
+                tensors = batch_rows_to_tensors(batch, rows, self.device)
                 tensors = self._apply_policy_action_mask(tensors)
+                actor_inputs = _actor_inputs(tensors)
+                actor_inputs["action_mask"] = None
+                logits = self.actors[core_type.value](**actor_inputs)
+                for offset, row in enumerate(rows):
+                    raw_logits[row] = logits[offset]
+                    base_masks[row] = tensors["action_mask"][offset]
+
+            for row in decision_rows:
+                agent_id = batch.agent_ids[row]
+                mask = base_masks[row].clone()
                 for claimed_slot in claimed_slots:
-                    tensors["action_mask"][:, claimed_slot] = False
-                if not torch.any(tensors["action_mask"]):
+                    mask[claimed_slot] = False
+                if not torch.any(mask):
                     continue
-                logits = self.actors[core_type.value](**tensors)
-                dist = Categorical(logits=logits)
-                sampled_actions = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
+                masked_logits = mask_logits(
+                    raw_logits[row].unsqueeze(0),
+                    mask.unsqueeze(0),
+                )
+                dist = Categorical(logits=masked_logits)
+                sampled_actions = (
+                    torch.argmax(masked_logits, dim=-1)
+                    if deterministic
+                    else dist.sample()
+                )
                 sampled_log_probs = dist.log_prob(sampled_actions)
 
                 action = int(sampled_actions[0].item())
                 actions[agent_id] = action
                 log_probs[agent_id] = float(sampled_log_probs[0].item())
-                effective_masks[agent_id] = tensors["action_mask"][0].cpu().numpy()
+                effective_masks[agent_id] = mask.cpu().numpy()
                 if action > 0:
                     claimed_slots.add(action)
 
@@ -120,26 +152,46 @@ class TorchACACPolicy(nn.Module):
         self,
         transitions: list[AgentTransition],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        log_probs: list[torch.Tensor] = []
-        entropies: list[torch.Tensor] = []
-
-        for transition in transitions:
-            tensors = transition_row_to_tensors(transition, self.device)
-            tensors["action_mask"] = torch.as_tensor(
-                transition.action_mask,
-                dtype=torch.bool,
-                device=self.device,
-            ).unsqueeze(0)
-            core_type = list(CoreType)[int(transition.obs.core_type_indices[transition.agent_index])]
-            logits = self.actors[core_type.value](**_actor_inputs(tensors))
-            dist = Categorical(logits=logits)
-            action = torch.tensor([transition.action], dtype=torch.long, device=self.device)
-            log_probs.append(dist.log_prob(action).squeeze(0))
-            entropies.append(dist.entropy().squeeze(0))
-
         if not transitions:
             empty = torch.empty(0, device=self.device)
             return empty, empty
+
+        log_probs: list[torch.Tensor | None] = [None] * len(transitions)
+        entropies: list[torch.Tensor | None] = [None] * len(transitions)
+
+        # Group transitions by core type so each type-shared actor runs a single
+        # batched forward instead of one forward per transition.
+        groups: dict[CoreType, list[int]] = {}
+        for position, transition in enumerate(transitions):
+            core_type = list(CoreType)[
+                int(transition.obs.core_type_indices[transition.agent_index])
+            ]
+            groups.setdefault(core_type, []).append(position)
+
+        for core_type, positions in groups.items():
+            rows = []
+            for position in positions:
+                transition = transitions[position]
+                tensors = transition_row_to_tensors(transition, self.device)
+                tensors["action_mask"] = torch.as_tensor(
+                    transition.action_mask,
+                    dtype=torch.bool,
+                    device=self.device,
+                ).unsqueeze(0)
+                rows.append(tensors)
+            batched = _stack_tensor_dicts(rows)
+            logits = self.actors[core_type.value](**_actor_inputs(batched))
+            dist = Categorical(logits=logits)
+            chosen = torch.tensor(
+                [transitions[position].action for position in positions],
+                dtype=torch.long,
+                device=self.device,
+            )
+            group_log_probs = dist.log_prob(chosen)
+            group_entropies = dist.entropy()
+            for offset, position in enumerate(positions):
+                log_probs[position] = group_log_probs[offset]
+                entropies[position] = group_entropies[offset]
 
         return torch.stack(log_probs), torch.stack(entropies)
 
@@ -170,41 +222,60 @@ class TorchACACPolicy(nn.Module):
         tensors["action_mask"][:, 0] = False
         return tensors
 
+    def _critic_values(self, batches: list[AgentBatch]) -> torch.Tensor:
+        """Per-batch mean agent value, computed with a single batched critic
+        forward per agent-count group instead of one forward per transition."""
+
+        if not batches:
+            return torch.empty(0, device=self.device)
+
+        values: list[torch.Tensor | None] = [None] * len(batches)
+        # Group by agent count so rows stack cleanly (the per-agent ``other``
+        # dimension equals num_agents - 1, which must match within a batch).
+        groups: dict[int, list[int]] = {}
+        for position, batch in enumerate(batches):
+            groups.setdefault(batch.num_agents, []).append(position)
+
+        for _, positions in groups.items():
+            rows = []
+            counts = []
+            for position in positions:
+                batch = batches[position]
+                tensors = batch_rows_to_tensors(
+                    batch,
+                    list(range(batch.num_agents)),
+                    self.device,
+                )
+                rows.append(tensors)
+                counts.append(batch.num_agents)
+            batched = _stack_tensor_dicts(rows)
+            flat_values = self.critic(**_critic_inputs(batched))
+            start = 0
+            for offset, position in enumerate(positions):
+                count = counts[offset]
+                values[position] = flat_values[start : start + count].mean()
+                start += count
+
+        return torch.stack(values)
+
     def values_for_joint_transitions(
         self,
         transitions: list[JointMacroTransition],
         *,
         next_obs: bool = False,
     ) -> torch.Tensor:
-        values = []
+        batches = [
+            transition.next_obs if next_obs else transition.obs
+            for transition in transitions
+        ]
         with torch.no_grad():
-            for transition in transitions:
-                batch = transition.next_obs if next_obs else transition.obs
-                tensors = batch_rows_to_tensors(
-                    batch,
-                    list(range(batch.num_agents)),
-                    self.device,
-                )
-                values.append(self.critic(**_critic_inputs(tensors)).mean())
-        if not values:
-            return torch.empty(0, device=self.device)
-        return torch.stack(values)
+            return self._critic_values(batches)
 
     def evaluate_joint_transitions(
         self,
         transitions: list[JointMacroTransition],
     ) -> torch.Tensor:
-        values = []
-        for transition in transitions:
-            tensors = batch_rows_to_tensors(
-                transition.obs,
-                list(range(transition.obs.num_agents)),
-                self.device,
-            )
-            values.append(self.critic(**_critic_inputs(tensors)).mean())
-        if not values:
-            return torch.empty(0, device=self.device)
-        return torch.stack(values)
+        return self._critic_values([transition.obs for transition in transitions])
 
 
 class ACACTrainer:
@@ -425,6 +496,13 @@ def normalize_entropy(
     if not torch.any(learnable):
         return torch.zeros((), dtype=entropies.dtype, device=entropies.device)
     return torch.mean(entropies[learnable] / max_entropies[learnable])
+
+
+def _stack_tensor_dicts(
+    rows: list[dict[str, torch.Tensor]],
+) -> dict[str, torch.Tensor]:
+    """Concatenate a list of per-row tensor dicts along the batch dimension."""
+    return {key: torch.cat([row[key] for row in rows], dim=0) for key in rows[0]}
 
 
 def batch_rows_to_tensors(

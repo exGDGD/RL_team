@@ -52,7 +52,12 @@ def main() -> None:
     parser.add_argument("--clip-ratio", type=float, default=0.05)
     parser.add_argument("--entropy-coef", type=float, default=0.0)
     parser.add_argument("--update-epochs", type=int, default=2)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Torch device: 'auto' (CUDA if available else CPU), 'cpu', or 'cuda'.",
+    )
     parser.add_argument(
         "--pretrained-actors",
         type=Path,
@@ -83,6 +88,15 @@ def main() -> None:
                 "install torch in the active environment."
             ) from exc
         raise
+
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device.startswith("cuda"):
+        # TF32 matmul/conv: large speedup on Ampere+ GPUs (Colab T4/A100) at
+        # negligible precision cost for these small MLP/attention heads.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("using GPU device=%s (TF32 enabled)", args.device)
 
     config = ACACConfig(
         hidden_dim=args.hidden_dim,
@@ -261,8 +275,45 @@ def evaluate_policy(
         episodes=episodes,
         deterministic=False,
     )
-    summary["baselines"] = evaluate_baselines(args, base_seed=base_seed, episodes=episodes)
+    summary["baselines"] = cached_evaluate_baselines(
+        args, base_seed=base_seed, episodes=episodes
+    )
     return summary
+
+
+# Baselines do not depend on the learned policy and the evaluation seed/config
+# is fixed across a training run, so their summary is identical at every eval
+# point. Computing it once instead of every `--eval-every` removes the bulk of
+# the per-eval episode cost (3 baselines x eval-episodes each).
+_BASELINE_CACHE: dict[tuple[Any, ...], dict[str, dict[str, float]]] = {}
+
+
+def cached_evaluate_baselines(
+    args: argparse.Namespace,
+    *,
+    base_seed: int,
+    episodes: int,
+) -> dict[str, dict[str, float]]:
+    key = (
+        base_seed,
+        episodes,
+        getattr(args, "arrival_rate", 1.0),
+        getattr(args, "episode_time", 80.0),
+        getattr(args, "max_tasks", 64),
+        getattr(args, "enable_preemption", False),
+        getattr(args, "progress_work", 0.0),
+        getattr(args, "completion", 0.0),
+        getattr(args, "completion_work", 0.0),
+        getattr(args, "lambda_energy", 0.1),
+        getattr(args, "lambda_starvation", 0.05),
+        getattr(args, "lambda_latency", 0.5),
+        getattr(args, "starvation_max_wait_weight", 0.5),
+    )
+    cached = _BASELINE_CACHE.get(key)
+    if cached is None:
+        cached = evaluate_baselines(args, base_seed=base_seed, episodes=episodes)
+        _BASELINE_CACHE[key] = cached
+    return cached
 
 
 def evaluate_rl_policy(
