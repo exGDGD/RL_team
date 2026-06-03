@@ -20,6 +20,8 @@ class Task:
     io_waits: list[float] = field(default_factory=list)
     cpu_progress: float = 0.0
     current_burst_idx: int = 0
+    current_burst_elapsed: float = 0.0
+    preemptions: int = 0
     ready_since: float | None = None
     first_started_at: float | None = None
     completed_at: float | None = None
@@ -46,11 +48,13 @@ class Task:
 
     @property
     def current_cpu_burst(self) -> float:
-        return self.cpu_bursts[self.current_burst_idx]
+        """Remaining CPU time in the current burst (full burst minus any work
+        already consumed by a preempted run)."""
+        return self.cpu_bursts[self.current_burst_idx] - self.current_burst_elapsed
 
     @property
     def remaining_cpu_work(self) -> float:
-        return sum(self.cpu_bursts[self.current_burst_idx :])
+        return self.current_cpu_burst + sum(self.cpu_bursts[self.current_burst_idx + 1 :])
 
     @property
     def has_next_io(self) -> bool:
@@ -78,6 +82,7 @@ class Task:
 
     def finish_current_burst(self, now: float) -> float | None:
         self.cpu_progress += self.current_cpu_burst
+        self.current_burst_elapsed = 0.0
         if self.current_burst_idx == len(self.cpu_bursts) - 1:
             self.completed_at = now
             return None
@@ -85,6 +90,17 @@ class Task:
         io_wait = self.io_waits[self.current_burst_idx]
         self.current_burst_idx += 1
         return io_wait
+
+    def preempt_current_burst(self, work_done: float) -> None:
+        """Interrupt the current run after `work_done` CPU time was executed.
+
+        The task stays on the same burst (its remaining shrinks) and is meant to
+        be returned to the ready queue. `cpu_progress` reflects the partial work.
+        """
+        work_done = max(0.0, min(work_done, self.current_cpu_burst))
+        self.cpu_progress += work_done
+        self.current_burst_elapsed += work_done
+        self.preemptions += 1
 
     def response_time(self) -> float | None:
         """Time from arrival until the task first receives CPU service."""

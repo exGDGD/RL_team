@@ -79,9 +79,15 @@ class SchedulerEnv:
         seed: int | None = None,
         reward_weights: RewardWeights | None = None,
         reward_mode: RewardMode | str = RewardMode.EVENT_SHAPED,
+        enable_preemption: bool = False,
+        preempt_min_run: float = 0.5,
+        starvation_threshold: float = 100.0,
     ) -> None:
         self.core_config = core_config or DEFAULT_CORE_CONFIG
         self.queue_size = queue_size
+        self.enable_preemption = enable_preemption
+        self.preempt_min_run = preempt_min_run
+        self.starvation_threshold = starvation_threshold
         self.workload_config = WorkloadConfig(
             scenario=workload_scenario,
             arrival_rate=arrival_rate,
@@ -141,6 +147,7 @@ class SchedulerEnv:
             "assignments": {},
             "conflicts": {},
             "invalid_actions": {},
+            "preemptions": {},
             "finished_runs": [],
         }
 
@@ -159,7 +166,10 @@ class SchedulerEnv:
         self._last_rewards = {agent: 0.0 for agent in self.agents}
         self._last_step_info = self._resolve_and_dispatch(actions)
 
-        self._advance_to_decision()
+        # If no core changed assignment (everyone kept / NO-OP) we must force
+        # simulated time forward, otherwise the same decision point repeats.
+        made_change = bool(self._last_step_info["assignments"])
+        self._advance_to_decision(force_progress=not made_change)
         terminated = self._terminated()
         truncated = (not terminated) and self._truncated()
         terminations = {agent: terminated for agent in self.agents}
@@ -182,6 +192,7 @@ class SchedulerEnv:
             "assignments": dict(self._last_step_info["assignments"]),
             "conflicts": dict(self._last_step_info["conflicts"]),
             "invalid_actions": dict(self._last_step_info["invalid_actions"]),
+            "preemptions": dict(self._last_step_info.get("preemptions", {})),
             "finished_runs": list(self._last_step_info["finished_runs"]),
         }
 
@@ -235,12 +246,19 @@ class SchedulerEnv:
         if agent_id not in expected_agents:
             raise KeyError(f"Unknown agent id: {agent_id}")
 
-    def _advance_to_decision(self) -> None:
+    def _advance_to_decision(self, *, force_progress: bool = False) -> None:
+        first = True
         while not self._episode_over():
             self._release_arrivals()
             self._release_io()
-            if self.ready_queue and any(not core.busy for core in self.cores.values()):
-                return
+            # `force_progress` skips the return check for the current instant only,
+            # so a step where nobody changed assignment advances to the next event
+            # instead of re-offering the same decision point (no infinite loop).
+            if not (force_progress and first):
+                idle_can_act = any(not core.busy for core in self.cores.values())
+                if self.ready_queue and (idle_can_act or self._any_preempt_eligible()):
+                    return
+            first = False
 
             next_time = self._next_event_time()
             if next_time is None:
@@ -259,12 +277,16 @@ class SchedulerEnv:
         assignments: dict[str, int] = {}
         conflicts: dict[str, int] = {}
         invalid_actions: dict[str, int] = {}
+        preemptions: dict[str, int] = {}
+        finished_runs: list[dict[str, Any]] = []
 
         for agent_id in self.agents:
             core = self.cores[agent_id]
             action = int(actions.get(agent_id, 0))
-            if core.busy or action == 0:
-                continue
+            if action == 0:
+                continue  # no change: idle NO-OP or busy keep
+            if core.busy and not self.enable_preemption:
+                continue  # busy cores cannot act unless preemption is enabled
             if action < 0 or action > self.queue_size:
                 invalid_actions[agent_id] = action
                 continue
@@ -284,6 +306,16 @@ class SchedulerEnv:
                 conflicts[agent_id] = task.pid
                 continue
 
+            if core.busy:
+                # Preempt the running task, then switch. Context-switch cost is
+                # charged to the core that chose to preempt (§14-B).
+                self._preempt_core(core, finished_runs)
+                cs_penalty = (
+                    self.reward_weights.context_switch * core.spec.context_switch_cost
+                )
+                self._last_rewards[core.core_id] -= cs_penalty
+                preemptions[agent_id] = task.pid
+
             claimed_pids.add(task.pid)
             assignments[agent_id] = task.pid
             self._dispatch(core, live_task)
@@ -292,7 +324,8 @@ class SchedulerEnv:
             "assignments": assignments,
             "conflicts": conflicts,
             "invalid_actions": invalid_actions,
-            "finished_runs": [],
+            "preemptions": preemptions,
+            "finished_runs": finished_runs,
         }
 
     def _pop_ready_task(self, pid: int) -> Task | None:
@@ -370,6 +403,103 @@ class SchedulerEnv:
                 self.completed_tasks.append(task)
             elif io_wait is not None:
                 heapq.heappush(self._io_events, (self.sim.now + io_wait, task.pid))
+
+    def _pop_running_event(
+        self, core_id: str
+    ) -> tuple[float, int, str, int, float] | None:
+        for idx, event in enumerate(self._running_events):
+            if event[2] == core_id:
+                self._running_events.pop(idx)
+                heapq.heapify(self._running_events)
+                return event
+        return None
+
+    def _preempt_core(self, core: Core, finished_runs: list[dict[str, Any]]) -> None:
+        """Interrupt a running core mid-burst, returning its task to the queue.
+
+        Emits a partial finished-run event (no completion) and charges the
+        partial energy/starvation cost. The remaining burst shrinks; the task is
+        re-queued so a later decision can resume or re-place it.
+        """
+
+        now = self.sim.now
+        pid = core.current_task_pid
+        event = self._pop_running_event(core.core_id)
+        if event is None or pid is None:
+            return
+        finish_time, _seq, _core_id, _ev_pid, run_time = event
+        start_time = finish_time - run_time
+        elapsed = max(0.0, now - start_time)
+        task = self.tasks[pid]
+        burst_at_dispatch = task.current_cpu_burst
+        fraction = 0.0 if run_time <= 0.0 else max(0.0, min(1.0, elapsed / run_time))
+        work_done = fraction * burst_at_dispatch
+
+        energy_cost, starvation_cost = self._burst_costs(core, elapsed)
+        core.release(now, elapsed)
+        task.accumulate_costs(energy_cost=energy_cost, starvation_cost=starvation_cost)
+        task.preempt_current_burst(work_done)
+        task.mark_ready(now)
+        self.ready_queue.append(task)
+
+        reward = self._reward_for_partial_burst(work_done, energy_cost, starvation_cost)
+        self._last_rewards[core.core_id] += reward
+        finished_runs.append(
+            {
+                "core_id": core.core_id,
+                "pid": pid,
+                "time": now,
+                "run_time": elapsed,
+                "reward": reward,
+                "task_done": False,
+                "preempted": True,
+            }
+        )
+
+    def _reward_for_partial_burst(
+        self,
+        cpu_work_done: float,
+        energy_cost: float,
+        starvation_cost: float,
+    ) -> float:
+        weights = self.reward_weights
+        event_cost = -weights.energy * energy_cost - weights.starvation * starvation_cost
+        if self.reward_mode == RewardMode.EVENT_SHAPED:
+            return weights.progress_work * self._normalized_work(cpu_work_done) + event_cost
+        if self.reward_mode == RewardMode.EVENT_COST:
+            return event_cost
+        # COMPLETION_ONLY: costs accrue on the task and are emitted at completion.
+        return 0.0
+
+    def _core_preempt_eligible(self, core: Core) -> bool:
+        """check_preempt gate: is this busy core at a preemption decision point?
+
+        Mirrors real schedulers' wakeup preemption check — P1 priority
+        (a higher latency class waits) or P3 starvation (a task waited past the
+        threshold) — guarded by a minimum-run granularity to avoid thrashing.
+        """
+
+        if not (self.enable_preemption and core.busy):
+            return False
+        if core.task_started_at is None:
+            return False
+        now = self.sim.now
+        if (now - core.task_started_at) < self.preempt_min_run:
+            return False
+        running = self.tasks.get(core.current_task_pid)
+        if running is None:
+            return False
+        for task in self.ready_queue[: self.queue_size]:
+            if task.latency_class > running.latency_class:  # P1 priority preemption
+                return True
+            if task.waiting_time(now) > self.starvation_threshold:  # P3 starvation
+                return True
+        return False
+
+    def _any_preempt_eligible(self) -> bool:
+        if not self.enable_preemption:
+            return False
+        return any(self._core_preempt_eligible(core) for core in self.cores.values())
 
     def _runtime_on_core(self, core: Core, task: Task) -> float:
         mismatch = self._mismatch_penalty(core.core_type, task)
@@ -480,6 +610,23 @@ class SchedulerEnv:
             sum(float(c.busy) for c in self.cores.values()) / max(1, len(self.cores))
         )
         elapsed_current = 0.0 if core.task_started_at is None else now - core.task_started_at
+
+        running_latency = 0.0
+        running_intensity = 0.0
+        running_progress = 0.0
+        if core.busy and core.current_task_pid is not None:
+            running_task = self.tasks[core.current_task_pid]
+            running_latency = float(running_task.latency_class)
+            running_intensity = running_task.cpu_intensity
+            running_progress = running_task.cpu_progress
+
+        # A busy core is only a decision point when it is preemption-eligible;
+        # otherwise it gets no valid action so the rollout skips it.
+        if core.busy and not self._core_preempt_eligible(core):
+            action_mask = np.zeros((self.queue_size + 1,), dtype=np.int8)
+        else:
+            action_mask = np.concatenate([np.array([1], dtype=np.int8), ready_mask])
+
         return {
             "self": np.array(
                 [
@@ -488,6 +635,9 @@ class SchedulerEnv:
                     elapsed_current,
                     core.accumulated_energy,
                     now - core.last_decision_time,
+                    running_latency,
+                    running_intensity,
+                    running_progress,
                 ],
                 dtype=np.float32,
             ),
@@ -500,9 +650,7 @@ class SchedulerEnv:
                     type_counts,
                 ]
             ),
-            "action_mask": np.concatenate(
-                [np.array([1], dtype=np.int8), ready_mask]
-            ),
+            "action_mask": action_mask,
         }
 
     def _core_type_index(self, core_type: CoreType) -> int:

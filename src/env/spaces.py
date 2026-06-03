@@ -6,7 +6,7 @@ from gymnasium import spaces
 from .core import CoreType
 
 
-SELF_FEATURE_DIM = 5
+SELF_FEATURE_DIM = 8
 READY_TASK_FEATURE_DIM = 6
 OTHER_CORE_FEATURE_DIM = 3
 SYSTEM_FEATURE_DIM = 2 + len(CoreType)
@@ -27,9 +27,11 @@ def build_observation_space(
     return spaces.Dict(
         {
             "self": spaces.Box(
-                low=np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                # [core_type, busy, elapsed, energy, dt_since,
+                #  running_latency_class, running_cpu_intensity, running_cpu_progress]
+                low=np.zeros((SELF_FEATURE_DIM,), dtype=np.float32),
                 high=np.array(
-                    [max_core_type, 1.0, np.inf, np.inf, np.inf],
+                    [max_core_type, 1.0, np.inf, np.inf, np.inf, 2.0, 1.0, np.inf],
                     dtype=np.float32,
                 ),
                 dtype=np.float32,

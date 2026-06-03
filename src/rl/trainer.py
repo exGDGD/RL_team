@@ -452,8 +452,12 @@ def normalize_observation_tensors(
 
     tensors = dict(tensors)
     self_features = tensors["self_features"].clone()
+    # self = [core_type, busy, elapsed, energy, dt_since,
+    #         running_latency_class, running_cpu_intensity, running_cpu_progress]
     self_features[:, 0] = self_features[:, 0] / max(len(CoreType) - 1, 1)
-    self_features[:, 2:] = torch.log1p(self_features[:, 2:])
+    self_features[:, 2:5] = torch.log1p(self_features[:, 2:5])
+    self_features[:, 5] = self_features[:, 5] / 2.0
+    self_features[:, 7] = torch.log1p(self_features[:, 7])
     tensors["self_features"] = self_features
 
     ready_queue = tensors["ready_queue"].clone()

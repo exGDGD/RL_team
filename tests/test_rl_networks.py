@@ -11,7 +11,7 @@ def test_type_shared_actor_outputs_masked_action_logits() -> None:
     queue_size = 5
 
     logits = actor(
-        self_features=torch.zeros(batch_size, 5),
+        self_features=torch.zeros(batch_size, 8),
         ready_queue=torch.zeros(batch_size, queue_size, 6),
         ready_mask=torch.ones(batch_size, queue_size),
         other_cores=torch.zeros(batch_size, 2, 3),
@@ -36,7 +36,7 @@ def test_agent_centric_critic_outputs_one_value_per_agent() -> None:
     batch_size = 3
 
     values = critic(
-        self_features=torch.zeros(batch_size, 5),
+        self_features=torch.zeros(batch_size, 8),
         ready_queue=torch.zeros(batch_size, 5, 6),
         ready_mask=torch.ones(batch_size, 5),
         other_cores=torch.zeros(batch_size, 2, 3),
