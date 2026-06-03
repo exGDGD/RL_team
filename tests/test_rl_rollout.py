@@ -56,7 +56,10 @@ def test_collect_episode_returns_agent_centric_transitions() -> None:
     assert env.completed_tasks
 
 
-def test_collect_episode_does_not_store_noop_as_pending_macro_action() -> None:
+def test_collect_episode_records_idle_noop_as_transition() -> None:
+    """NO-OP is now an explicit, learnable action (item 2): an idle core that
+    chooses to wait is recorded as its own transition with action 0."""
+
     env = SchedulerEnv(
         core_config={CoreType.P: 1},
         workload_scenario=WorkloadScenario.BALANCED,
@@ -68,7 +71,37 @@ def test_collect_episode_does_not_store_noop_as_pending_macro_action() -> None:
 
     buffer = collect_episode(env, NoOpPolicy(), seed=3, max_env_steps=3)
 
-    assert len(buffer) == 0
+    assert len(buffer) > 0
+    assert all(transition.action == 0 for transition in buffer.transitions)
+
+
+def test_collect_episode_with_preemption_records_consistent_transitions() -> None:
+    """With preemption enabled a busy core can switch tasks mid-run. The rollout
+    must record those switches as transitions without corrupting credit
+    assignment (every transition still maps to a valid joint interval)."""
+
+    env = SchedulerEnv(
+        core_config={CoreType.E: 1},
+        workload_scenario=WorkloadScenario.BURST_STRESS,
+        arrival_rate=3.0,
+        episode_time=60.0,
+        max_tasks=40,
+        seed=5,
+        enable_preemption=True,
+        preempt_min_run=0.0,
+    )
+
+    buffer = collect_episode(env, FirstValidPolicy(), seed=5)
+
+    # A preemption actually happened in this scenario.
+    assert sum(task.preemptions for task in env.tasks.values()) > 0
+    assert len(buffer) > 0
+    assert len(buffer.joint_transitions) == buffer.env_steps
+    assert all(
+        0 <= transition.joint_index < len(buffer.joint_transitions)
+        for transition in buffer.transitions
+    )
+    assert all(transition.elapsed_time >= 0.0 for transition in buffer.transitions)
 
 
 def test_single_agent_transition_rewards_match_environment_reward() -> None:

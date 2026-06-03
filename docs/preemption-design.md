@@ -1,6 +1,12 @@
 # Preemption 설계 스펙 (6/3 패치 item 3 구체화)
 
-> **상태:** 설계 확정 대기 (구현 전)
+> **상태:** 구현 완료 (env 기반 + RL 활성화). item 1(obs burst 제거)만 남음.
+>
+> **구현 상태 (2026-06-03):**
+> - ✅ env 기반: 부분 burst, preempt 기계, P1/P3+min_run 게이트, CS 비용, self 8-dim, force_progress (`enable_preemption` 플래그)
+> - ✅ RL 활성화: `obs.decision_mask=has_task_action`, rollout preempt transition(닫고-열기 + 동일 step 완료 처리) + idle NO-OP 기록(item 2), `allow_noop=True`, `train_acac --disable-preemption`(기본 on)
+> - ✅ 검증: runnable 테스트 43 passed (preemption 발생·credit 일관성·NO-OP 기록 포함). torch 네트워크 테스트 2개는 미설치로 skip — `rl-team`에서 확인 필요.
+> - ⬜ item 1: ready_queue 6→4 (burst 정답지 제거) — 다음 단계
 > **선행 논의:** teamplo 6/3 패치 — item 1(obs에서 burst 제거)·item 2(NO-OP 활성)·item 3(preemption+CS 비용)
 > **결정된 순서:** preemption(+NO-OP)을 **먼저** 구현 → 그다음 obs burst 제거(item 1).
 > 이유: burst를 먼저 빼면 "obs 불확실 + 복구 불가"가 겹쳐 중간 단계 에이전트가 최악이 됨. preemption이 "돌려보고 고치는" 복구 메커니즘을 먼저 제공해야 함.

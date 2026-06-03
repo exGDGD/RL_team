@@ -76,9 +76,11 @@ def build_agent_batch(
 
     core_type_indices = self_features[:, 0].astype(np.int64)
     delta_t = self_features[:, 4].astype(np.float32)
-    is_idle = self_features[:, 1] == 0.0
+    # A core is at a decision point iff it has a valid task action. The env
+    # encodes eligibility into the action mask: idle cores and preemption-eligible
+    # busy cores get [keep, ready_slots...]; other busy cores get an all-zero mask.
     has_task_action = np.any(action_mask[:, 1:] == 1, axis=1)
-    decision_mask = np.logical_and(is_idle, has_task_action)
+    decision_mask = has_task_action
     other_core_mask = np.ones(other_cores.shape[:2], dtype=np.int8)
 
     return AgentBatch(

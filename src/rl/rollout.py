@@ -41,6 +41,12 @@ def collect_episode(
         actions = {agent_id: 0 for agent_id in env.agents}
         chosen_actions, log_probs, effective_masks = _unpack_policy_output(policy.act(batch))
         proposed_agent_ids: set[str] = set()
+        # Preempt decisions by an already-running core must open their new pending
+        # only AFTER this step closes the core's old (now preempted) run, otherwise
+        # the two pendings would collide on the agent_id key.
+        preempt_to_open: list[PendingDecision] = []
+        interval_start_time = float(info["time"])
+        current_joint_index = len(buffer.joint_transitions)
 
         for agent_id in batch.decision_agent_ids():
             agent_index = batch.agent_ids.index(agent_id)
@@ -51,24 +57,37 @@ def collect_episode(
             if task_choices <= 1:
                 buffer.forced_decisions += 1
             action = int(chosen_actions.get(agent_id, 0))
-            if action == 0:
-                continue
-            if agent_id in pending:
-                raise RuntimeError(f"Agent {agent_id} has an unfinished pending decision.")
-            actions[agent_id] = action
-            proposed_agent_ids.add(agent_id)
-            pending[agent_id] = PendingDecision(
+            is_busy = bool(batch.self_features[agent_index, 1] == 1.0)
+            decision = PendingDecision(
                 agent_id=agent_id,
                 agent_index=agent_index,
                 obs=batch,
                 action=action,
                 log_prob=float(log_probs.get(agent_id, 0.0)),
                 action_mask=effective_masks.get(agent_id, batch.action_mask[agent_index]).copy(),
-                start_time=float(info["time"]),
-                joint_index=len(buffer.joint_transitions),
+                start_time=interval_start_time,
+                joint_index=current_joint_index,
             )
 
-        interval_start_time = float(info["time"])
+            if action == 0:
+                # No-change. A busy keep is subsumed by the ongoing run transition;
+                # an idle NO-OP is recorded as its own (item 2) decision.
+                if not is_busy:
+                    pending[agent_id] = decision
+                continue
+
+            actions[agent_id] = action
+            if is_busy:
+                # Preempt + switch: defer opening until the old run closes below.
+                preempt_to_open.append(decision)
+            else:
+                if agent_id in pending:
+                    raise RuntimeError(
+                        f"Agent {agent_id} has an unfinished pending decision."
+                    )
+                proposed_agent_ids.add(agent_id)
+                pending[agent_id] = decision
+
         next_observations, rewards, terminations, truncations, next_info = env.step(actions)
         buffer.env_steps += 1
         raw_team_reward = float(sum(rewards.values()))
@@ -124,6 +143,45 @@ def collect_episode(
             terminated=terminated,
             truncated=truncated,
         )
+
+        # The preempted runs have now closed; open the switch decisions that the
+        # environment actually dispatched (a conflicted preempt leaves the core
+        # running, so its original pending stays untouched). If the switched-to
+        # run already ended within this same step, record it now so no stale
+        # pending lingers under the agent key.
+        assigned_agent_ids = set(next_info.get("assignments", {}))
+        for decision in preempt_to_open:
+            if decision.agent_id not in assigned_agent_ids:
+                continue
+            next_agent_index = next_batch.agent_ids.index(decision.agent_id)
+            run_ended = (
+                terminated
+                or truncated
+                or bool(next_batch.self_features[next_agent_index, 1] == 0.0)
+            )
+            if run_ended:
+                buffer.append(
+                    AgentTransition(
+                        agent_id=decision.agent_id,
+                        episode_id=0,
+                        agent_index=decision.agent_index,
+                        obs=decision.obs,
+                        action=decision.action,
+                        log_prob=decision.log_prob,
+                        action_mask=decision.action_mask,
+                        reward=decision.accumulated_reward,
+                        next_obs=next_batch,
+                        next_agent_index=next_agent_index,
+                        joint_index=decision.joint_index,
+                        elapsed_time=max(
+                            0.0, float(next_info["time"]) - decision.start_time
+                        ),
+                        terminated=terminated,
+                        truncated=truncated,
+                    )
+                )
+            else:
+                pending[decision.agent_id] = decision
 
         batch = next_batch
         info = next_info

@@ -33,6 +33,11 @@ def main() -> None:
     parser.add_argument("--arrival-rate", type=float, default=1.0)
     parser.add_argument("--episode-time", type=float, default=80.0)
     parser.add_argument("--max-tasks", type=int, default=64)
+    parser.add_argument(
+        "--disable-preemption",
+        action="store_true",
+        help="Run the non-preemptive environment (ablation).",
+    )
     parser.add_argument("--progress-work", type=float, default=0.0)
     parser.add_argument("--completion", type=float, default=0.0)
     parser.add_argument("--completion-work", type=float, default=0.0)
@@ -63,6 +68,7 @@ def main() -> None:
         help="Checkpoint path to resume from, such as outputs/acac_p2e2/latest.pt.",
     )
     args = parser.parse_args()
+    args.enable_preemption = not args.disable_preemption
 
     logger = configure_logging(args.output_dir)
 
@@ -80,7 +86,7 @@ def main() -> None:
 
     config = ACACConfig(
         hidden_dim=args.hidden_dim,
-        allow_noop=False,
+        allow_noop=True,
         reward_scale=args.reward_scale,
         actor_learning_rate=args.actor_learning_rate,
         critic_learning_rate=args.critic_learning_rate,
@@ -218,6 +224,7 @@ def make_env(args: argparse.Namespace, *, seed: int) -> SchedulerEnv:
         max_tasks=args.max_tasks,
         seed=seed,
         reward_weights=reward_weights_from_args(args),
+        enable_preemption=getattr(args, "enable_preemption", False),
     )
 
 

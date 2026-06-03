@@ -31,7 +31,7 @@ class ACACConfig:
     max_grad_norm: float = 0.5
     actor_learning_rate: float = 3.0e-4
     critic_learning_rate: float = 3.0e-4
-    allow_noop: bool = False
+    allow_noop: bool = True
     update_epochs: int = 2
     reward_scale: float = 0.01
 
