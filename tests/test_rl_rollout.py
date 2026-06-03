@@ -104,6 +104,29 @@ def test_collect_episode_with_preemption_records_consistent_transitions() -> Non
     assert all(transition.elapsed_time >= 0.0 for transition in buffer.transitions)
 
 
+def test_idle_policy_truncates_without_spinning() -> None:
+    """A policy that never dispatches must truncate at the horizon, not spin at
+    a frozen clock until max_env_steps. Regression: once all arrivals drained
+    with tasks still queued and nothing running, the simulation clock froze and
+    idle (deterministic eval) episodes ran the full 10_000-step cap, making
+    evaluation take many minutes."""
+
+    env = SchedulerEnv(
+        core_config={CoreType.P: 2, CoreType.E: 2},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=1.0,
+        episode_time=40.0,
+        max_tasks=32,
+        seed=3,
+        enable_preemption=True,
+    )
+
+    buffer = collect_episode(env, NoOpPolicy(), seed=3)
+
+    # Healthy episodes here are tens of steps; the safety cap is 10_000.
+    assert buffer.env_steps < 500
+
+
 def test_single_agent_transition_rewards_match_environment_reward() -> None:
     env = SchedulerEnv(
         core_config={CoreType.P: 1},

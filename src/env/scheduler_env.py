@@ -262,6 +262,13 @@ class SchedulerEnv:
 
             next_time = self._next_event_time()
             if next_time is None:
+                # No future events remain, yet the episode is not over (ready
+                # tasks are still queued). Only an agent dispatch could change
+                # anything, and none happened at this instant. Advance to the
+                # horizon so a persistently idle policy truncates the episode
+                # instead of spinning at a frozen clock until max_env_steps.
+                if self.sim.now < self.max_sim_time:
+                    self.sim.run(until=self.max_sim_time)
                 return
             if next_time > self.max_sim_time:
                 self.sim.run(until=self.max_sim_time)

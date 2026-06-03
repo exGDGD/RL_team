@@ -29,6 +29,16 @@ def main() -> None:
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--eval-seed", type=int, default=10_000)
     parser.add_argument("--rollout-episodes", type=int, default=16)
+    parser.add_argument(
+        "--rollout-workers",
+        type=int,
+        default=1,
+        help=(
+            "Parallel rollout worker processes. 1 (default) runs in-process. "
+            ">1 collects episodes across CPU cores (workers do CPU inference; "
+            "the GPU policy is used only for the update)."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--arrival-rate", type=float, default=1.0)
     parser.add_argument("--episode-time", type=float, default=80.0)
@@ -143,33 +153,71 @@ def main() -> None:
         "logs=%s latest=%s best=%s", metrics_path, latest_path, best_path
     )
 
+    executor = None
+    if args.rollout_workers > 1:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        executor = ProcessPoolExecutor(
+            max_workers=args.rollout_workers,
+            mp_context=mp.get_context("spawn"),
+            initializer=_init_rollout_worker,
+            initargs=(config, rollout_env_kwargs(args)),
+        )
+        logger.info(
+            "parallel rollout: workers=%d (spawn, CPU inference)",
+            args.rollout_workers,
+        )
+
+    try:
+        run_training_loop(
+            policy=policy,
+            trainer=trainer,
+            args=args,
+            config=config,
+            logger=logger,
+            torch=torch,
+            executor=executor,
+            metrics_path=metrics_path,
+            latest_path=latest_path,
+            best_path=best_path,
+            start_episode=start_episode,
+            best_eval_reward=best_eval_reward,
+        )
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+
+def run_training_loop(
+    *,
+    policy,
+    trainer,
+    args: argparse.Namespace,
+    config,
+    logger,
+    torch,
+    executor,
+    metrics_path: Path,
+    latest_path: Path,
+    best_path: Path,
+    start_episode: int,
+    best_eval_reward: float,
+) -> None:
     for episode_idx in range(start_episode, args.episodes + 1):
-        rollout = RolloutBuffer()
-        env = None
-        for rollout_offset in range(args.rollout_episodes):
-            rollout_seed = (
-                args.seed
-                + (episode_idx - 1) * args.rollout_episodes
-                + rollout_offset
-                + 1
-            )
-            env = make_env(args, seed=rollout_seed)
-            rollout.extend(
-                collect_episode(
-                    env,
-                    policy,
-                    seed=rollout_seed,
-                    gamma=config.gamma,
-                )
-            )
+        rollout, metrics = collect_training_rollout(
+            policy,
+            args,
+            gamma=config.gamma,
+            episode_idx=episode_idx,
+            executor=executor,
+        )
         if len(rollout) == 0:
             logger.warning("ep %d skipped empty rollout", episode_idx)
             continue
 
-        assert env is not None
         stats = trainer.update(rollout)
         total_reward = rollout.total_env_reward / args.rollout_episodes
-        metrics = env.metrics()
         should_eval = episode_idx == start_episode or episode_idx % args.eval_every == 0
         eval_summary = (
             evaluate_policy(
@@ -229,17 +277,108 @@ def main() -> None:
             )
 
 
+def rollout_env_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Environment constructor kwargs (everything except the per-episode seed).
+
+    Shared by the in-process ``make_env`` and the rollout workers so a worker's
+    environment is byte-for-byte identical to the sequential one for a given
+    seed.
+    """
+    return {
+        "core_config": {CoreType.P: 2, CoreType.E: 2},
+        "workload_scenario": WorkloadScenario.BALANCED,
+        "arrival_rate": args.arrival_rate,
+        "episode_time": args.episode_time,
+        "max_tasks": args.max_tasks,
+        "reward_weights": reward_weights_from_args(args),
+        "enable_preemption": getattr(args, "enable_preemption", False),
+    }
+
+
 def make_env(args: argparse.Namespace, *, seed: int) -> SchedulerEnv:
     return SchedulerEnv(
-        core_config={CoreType.P: 2, CoreType.E: 2},
-        workload_scenario=WorkloadScenario.BALANCED,
-        arrival_rate=args.arrival_rate,
-        episode_time=args.episode_time,
-        max_tasks=args.max_tasks,
         seed=seed,
-        reward_weights=reward_weights_from_args(args),
-        enable_preemption=getattr(args, "enable_preemption", False),
+        **rollout_env_kwargs(args),
     )
+
+
+# --- Parallel rollout ------------------------------------------------------
+# The environment is a pure-Python discrete-event simulation (CPU bound), so
+# the rollout cannot run on the GPU. To use the host's cores we run several
+# independent episodes in worker processes. Workers do CPU-only inference with
+# a snapshot of the current weights; the main process keeps the GPU policy for
+# the gradient update. We use the 'spawn' start method so children never
+# inherit the parent's CUDA context (forking a CUDA process is unsafe).
+
+_ROLLOUT_WORKER: dict[str, Any] = {}
+
+
+def _init_rollout_worker(config: Any, env_kwargs: dict[str, Any]) -> None:
+    import torch
+
+    from src.rl.trainer import TorchACACPolicy
+
+    # One torch thread per worker avoids oversubscribing the (few) Colab cores.
+    torch.set_num_threads(1)
+    _ROLLOUT_WORKER["policy"] = TorchACACPolicy(config, device="cpu")
+    _ROLLOUT_WORKER["env_kwargs"] = env_kwargs
+
+
+def _run_rollout_worker(task: tuple[dict[str, Any], int, float]) -> tuple[RolloutBuffer, Any]:
+    import torch
+
+    state_dict, seed, gamma = task
+    policy = _ROLLOUT_WORKER["policy"]
+    policy.load_state_dict(state_dict)
+    policy.eval()
+    with torch.no_grad():
+        torch.manual_seed(seed)
+        env = SchedulerEnv(seed=seed, **_ROLLOUT_WORKER["env_kwargs"])
+        buffer = collect_episode(env, policy, seed=seed, gamma=gamma)
+    return buffer, env.metrics()
+
+
+def rollout_seeds(args: argparse.Namespace, episode_idx: int) -> list[int]:
+    return [
+        args.seed + (episode_idx - 1) * args.rollout_episodes + offset + 1
+        for offset in range(args.rollout_episodes)
+    ]
+
+
+def collect_training_rollout(
+    policy,
+    args: argparse.Namespace,
+    *,
+    gamma: float,
+    episode_idx: int,
+    executor,
+) -> tuple[RolloutBuffer, Any]:
+    """Collect ``rollout_episodes`` episodes and merge them in seed order.
+
+    Merging in seed order (not completion order) keeps episode ids and joint
+    indices identical to sequential collection, so credit assignment is
+    unchanged regardless of which worker finished first. Returns the merged
+    buffer and the metrics of the last-seed episode (matching the sequential
+    ``env.metrics()`` used for logging).
+    """
+
+    seeds = rollout_seeds(args, episode_idx)
+    rollout = RolloutBuffer()
+    last_metrics = None
+
+    if executor is None:
+        for seed in seeds:
+            env = make_env(args, seed=seed)
+            rollout.extend(collect_episode(env, policy, seed=seed, gamma=gamma))
+            last_metrics = env.metrics()
+        return rollout, last_metrics
+
+    cpu_state = {key: value.detach().cpu() for key, value in policy.state_dict().items()}
+    tasks = [(cpu_state, seed, gamma) for seed in seeds]
+    for buffer, metrics in executor.map(_run_rollout_worker, tasks):
+        rollout.extend(buffer)
+        last_metrics = metrics
+    return rollout, last_metrics
 
 
 def reward_weights_from_args(args: argparse.Namespace) -> RewardWeights:
