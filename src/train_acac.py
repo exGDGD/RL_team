@@ -361,15 +361,21 @@ def summarize_rollout_actions(rollout: RolloutBuffer) -> dict[str, float]:
         }
 
     actions = np.asarray([transition.action for transition in rollout.transitions])
-    selected_tasks = np.stack(
-        [
-            transition.obs.ready_queue[
-                transition.agent_index,
-                transition.action - 1,
+    # Selected-task features only apply to dispatch/preempt actions; NO-OP
+    # (action 0) selects no task and is excluded from the per-task averages.
+    dispatched = [transition for transition in rollout.transitions if transition.action > 0]
+    if dispatched:
+        selected_tasks = np.stack(
+            [
+                transition.obs.ready_queue[
+                    transition.agent_index,
+                    transition.action - 1,
+                ]
+                for transition in dispatched
             ]
-            for transition in rollout.transitions
-        ]
-    )
+        )
+    else:
+        selected_tasks = np.zeros((1, rollout.transitions[0].obs.ready_queue.shape[-1]))
     return {
         "mean_queue_slot": float(np.mean(actions)),
         "first_slot_fraction": float(np.mean(actions == 1)),
