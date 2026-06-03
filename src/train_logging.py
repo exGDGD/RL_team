@@ -66,10 +66,11 @@ def log_episode_train(
 ) -> None:
     """One compact progress line emitted every training episode."""
 
+    preempt_per_episode = rollout.preemptions / max(rollout.episodes, 1)
     get_logger().info(
         "ep %4d | reward %+8.3f | loss %7.3f (pi %+.4f  v %.3f  ent %.3f) "
         "| kl %.4f clip %.3f | grad a/c %.2f/%.2f "
-        "| conflict %d choices %.2f forced %.2f "
+        "| conflict %d preempt %.1f choices %.2f forced %.2f "
         "| done %d/%d thru %.3f turn %s",
         episode_idx,
         total_reward,
@@ -82,6 +83,7 @@ def log_episode_train(
         stats.actor_grad_norm,
         stats.critic_grad_norm,
         rollout.conflicts,
+        preempt_per_episode,
         rollout.mean_task_choices,
         rollout.forced_decision_fraction,
         metrics.completed_tasks,
@@ -97,11 +99,12 @@ def log_episode_eval(eval_summary: dict[str, Any]) -> None:
     logger = get_logger()
     baselines = eval_summary.get("baselines", {})
     logger.info(
-        "       eval | reward %+.3f (sampled %+.3f) | done %.1f "
+        "       eval | reward %+.3f (sampled %+.3f) | done %.1f | preempt %.1f "
         "| first_slot %.2f/%.2f",
         eval_summary["reward"],
         eval_summary["sampled"]["reward"],
         eval_summary["completed"],
+        eval_summary.get("preemptions", float("nan")),
         eval_summary["actions"]["first_slot_fraction"],
         eval_summary["sampled"]["actions"]["first_slot_fraction"],
     )

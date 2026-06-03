@@ -95,6 +95,7 @@ def collect_episode(
         buffer.total_env_reward += raw_team_reward
         buffer.conflicts += len(next_info.get("conflicts", {}))
         buffer.invalid_actions += len(next_info.get("invalid_actions", {}))
+        buffer.preemptions += len(next_info.get("preemptions", {}))
         _discard_rejected_decisions(
             pending=pending,
             proposed_agent_ids=proposed_agent_ids,

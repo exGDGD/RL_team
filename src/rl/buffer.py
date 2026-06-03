@@ -64,6 +64,7 @@ class RolloutBuffer:
     env_steps: int = 0
     conflicts: int = 0
     invalid_actions: int = 0
+    preemptions: int = 0
     decisions: int = 0
     forced_decisions: int = 0
     total_task_choices: int = 0
@@ -97,6 +98,7 @@ class RolloutBuffer:
         self.env_steps += other.env_steps
         self.conflicts += other.conflicts
         self.invalid_actions += other.invalid_actions
+        self.preemptions += other.preemptions
         self.decisions += other.decisions
         self.forced_decisions += other.forced_decisions
         self.total_task_choices += other.total_task_choices

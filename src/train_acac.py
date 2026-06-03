@@ -468,6 +468,7 @@ def evaluate_rl_policy(
     throughputs = []
     diagnostics = []
     action_summaries = []
+    preemptions = []
     with preserve_torch_rng(seed=base_seed, enabled=not deterministic):
         for offset in range(episodes):
             env = make_env(args, seed=base_seed + offset)
@@ -483,11 +484,13 @@ def evaluate_rl_policy(
             throughputs.append(metrics.throughput)
             diagnostics.append(env.reward_diagnostics())
             action_summaries.append(summarize_rollout_actions(rollout))
+            preemptions.append(rollout.preemptions)
 
     return {
         "reward": float(np.mean(rewards)),
         "completed": float(np.mean(completed)),
         "throughput": float(np.mean(throughputs)),
+        "preemptions": float(np.mean(preemptions)),
         "reward_diagnostics": mean_dict(diagnostics),
         "actions": mean_dict(action_summaries),
     }
@@ -612,6 +615,7 @@ def build_log_row(
         "env_steps": rollout.env_steps,
         "conflicts": rollout.conflicts,
         "invalid_actions": rollout.invalid_actions,
+        "preemptions": rollout.preemptions,
         "decisions": rollout.decisions,
         "mean_task_choices": rollout.mean_task_choices,
         "max_task_choices": rollout.max_task_choices,
