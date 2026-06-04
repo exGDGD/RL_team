@@ -2,12 +2,29 @@
 
 > **프로젝트:** ACAC 알고리즘 기반 Heterogeneous CPU Scheduling
 > **목적:** 팀원이 본 문서만으로 실험의 동기, 환경 설계, 검증 방법을 이해하도록 한다.
-> **상태:** ~~설계 단계 (구현 시작 전)~~ → **구현 진행 중** — 환경/Baseline/단일 구성(P2E2) ACAC sanity 학습 + **선점(preemption)/NO-OP 활성/burst 비노출**까지 구현 (W5–W6 + 6/3 패치). 🔧
-> **기준 커밋:** `dev` `ac22ca6` (6/3 패치 item 1 burst 제거, 2026-06-03). *(원 설계 기준은 `0366c5d`, 2026-05-31)*
+> **상태:** ~~설계 단계~~ → **구현 + 단일 구성(P2E2) 학습 성공** — 환경/Baseline/선점/NO-OP/burst 비노출에 더해, **지연 중심 보상(LATENCY_FLOW) 재설계 + GPU 가속 + 병렬 롤아웃**까지 구현. **학습된 정책이 SJF·EAS baseline을 추월**(6/4~6/5 실험). 🔧🆕
+> **기준 커밋:** `dev` `f40e60e` (2026-06-05). *(직전 문서 기준 `c51075b`(6/3) · 원 설계 기준 `0366c5d`(5/31))*
 > **git:** https://github.com/exGDGD/RL_team/tree/dev
 > **drive:** https://drive.google.com/drive/folders/1pwQYCoJ-rBIghPgGU1bfnvwb2HkzcbYX
 
 **마커 범례:** 🔧 [구현 반영] 설계안과 다르게 구현됨 · ✅ [해소/완료] 과거 열린 쟁점이 해결됨 · ⚠️ [확인 필요/미구현] · 🆕 [신규] 설계안에 없던 추가.
+
+---
+
+## 최근 변경 (커밋 이력: `c51075b` → `f40e60e`, 6/3 → 6/5)
+
+> 직전 문서 갱신(`c51075b`) 이후의 변경. 학습 인프라(속도/안정성)와 **보상 재설계**가 핵심이며, 이로써 단일 구성에서 **baseline 추월**을 달성했다.
+
+| 커밋 | 분류 | 내용 |
+|---|---|---|
+| `78b1174` | perf | **GPU 학습 가속** — actor/critic forward를 타입·transition 단위 batch=1 → **배칭 호출**, eval 베이스라인 **캐싱**(매 eval 재계산 제거), `--device auto`(+TF32). |
+| `3a8f2f8` | fix+perf | **idle 에피소드 무한 헛돔 수정**(미래 이벤트 0개 시 horizon으로 truncate; 10000스텝 spin → 정상 종료) + **병렬 롤아웃** `--rollout-workers`(spawn, CPU 워커 추론·GPU update). |
+| `502f89d` | feat | **preemption 카운트 로깅** — 롤아웃 버퍼→콘솔/jsonl. 정책의 선점 빈도를 직접 관찰. |
+| `3a59102` | **feat** | **`LATENCY_FLOW` 보상 모드** — 우선순위 가중 체류시간. **idle-free 결함 제거 + 지연 변별력 확보**(§5.3). 채점축(지연, baseline 상대)과 정렬. |
+| `25d5fa3` | test | Colab 테스트 수집 에러 수정(`tests` cross-import 제거). |
+| `f40e60e` | fix | 단일 코어에서 `other_cores` feature 차원 소실 수정((N,0)→(N,0,3); actor Linear shape mismatch 해소). |
+
+**핵심 결과(6/5):** `--reward-mode latency_flow`로 P2E2·BALANCED에서 학습 시, deterministic eval 보상이 **SJF(-745.9)·EAS(-848.2)를 추월**(best `-729.6`, ep190). 자세한 내용 §5.3 / §8.4.
 
 ---
 
@@ -26,8 +43,9 @@
 | Observation: self | 코어타입 one-hot + 직전 task 타입 | 코어타입 **인덱스 스칼라** + busy/경과/에너지/Δt + **현재 실행 task latency/intensity/progress (8-dim)** | 🔧 |
 | Action | NO-OP 포함 | 구현됨. 학습 시 **NO-OP 활성(allow_noop=True)**, 학습 transition으로 기록 | ✅ |
 | Preemption | 5/19에 추가 논의 | **구현됨** (M2 interruptible-options, P1 우선순위/P3 기아 게이트 + min_run, 부분 burst) | ✅ |
-| Reward 모드 | dense+sparse 병행 | **3 모드** (event_shaped / event_cost / completion_only) | 🔧 |
-| Starvation 항 | $\sum W_k^2 \cdot \Delta t$ | **log 기반** `(mean(log1p W)+0.5·max(log1p W))·Δt` | 🔧 |
+| Reward 모드 | dense+sparse 병행 | **4 모드** (event_shaped / event_cost / completion_only / **`latency_flow` 🆕**) | 🔧🆕 |
+| **지연 보상(채택)** | (명시 안 됨) | **`LATENCY_FLOW`**: 우선순위 가중 체류시간. idle-free·지연 변별력. **baseline 추월 달성** | 🆕 |
+| Starvation 항 | $\sum W_k^2 \cdot \Delta t$ | **log 기반** `(mean(log1p W)+0.5·max(log1p W))·Δt` (event 모드용) | 🔧 |
 | Context-switch 페널티 | $\lambda_C=1.0$ 적용 | **preempt switch 시 적용** (코어 타입별 cs 비용 × λ_C) | ✅ |
 | GAE | $\gamma^{\Delta t}$ time-scaled | 구현됨 + **joint macro-timeline** critic 추가 | 🔧 |
 | 같은타입 coordination | 순차 결정(obs 반영) | **사후 conflict 해소**(먼저인 코어 우선, 중복=NO-OP) | 🔧 |
@@ -35,6 +53,9 @@
 | SJF imitation 사전학습 | (계획에 없음) | **신규 추가** (actor를 SJF로 warm-start) | 🆕 |
 | 평가 trace replay | balanced_v1~10 등 고정 trace | stochastic generator만, **replay 미구현** | ⚠️ |
 | Baseline | 7종 | Random/RoundRobin/SJF/EAS **4종 구현**, 나머지 미구현 | 🔧 |
+| 병렬 rollout | (미언급) | **`--rollout-workers`** 구현(spawn, CPU 워커 추론) | 🆕 |
+| GPU 가속 | (미언급) | forward 배칭 + eval 캐싱 + `--device auto`/TF32 | 🆕 |
+| 선점 관측성 | (미언급) | preemption 카운트 로깅(콘솔/jsonl) | 🆕 |
 
 ---
 
@@ -252,13 +273,14 @@ io_waits[]      : 각 burst 사이 I/O 대기 시간 (len = phase-1)
 
 ### 5.3 Reward 함수 — 3개 모드로 일반화
 
-> 🔧 **[구현 반영]** 설계안의 "dense + sparse 병행"이 **3개의 명시적 reward mode**로 구현됨 (`RewardMode`):
+> 🔧 **[구현 반영]** 설계안의 "dense + sparse 병행"이 **4개의 명시적 reward mode**로 구현됨 (`RewardMode`). **현재 권장(채택) 모드는 `LATENCY_FLOW`** — §5.3.1 참고.
 >
 > | 모드 | 설명 |
 > |---|---|
 > | `EVENT_SHAPED` | 매 burst마다 work shaping + 비용, 완료 시 completion/latency 항 (dense) |
 > | `EVENT_COST` | burst 시 work shaping 없이 비용만, 완료 시 completion/latency |
 > | `COMPLETION_ONLY` | burst 비용은 내부 누적, 완료 시 한 번에 모두 지급 (sparse) |
+> | **`LATENCY_FLOW` 🆕** | **우선순위 가중 체류시간**(priority-weighted flow time). 매 스텝 "도착했지만 미완료인 task 수 × 우선순위 가중 × Δt"를 패널티로 부과. **idle이 공짜가 아니며**, 에피소드 합이 우선순위 가중 평균 turnaround와 일치 → 지연 채점축과 1:1 정렬. |
 
 **현재 `RewardWeights` 기본값** (`src/env/scheduler_env.py`):
 
@@ -273,6 +295,9 @@ io_waits[]      : 각 burst 사이 I/O 대기 시간 (len = phase-1)
 | `context_switch` (λ_C) | 1.0 |
 | `work_norm` | 10.0 |
 | `starvation_max_wait_weight` | 0.5 |
+| `flow_time` 🆕 (LATENCY_FLOW) | 1.0 |
+| `latency_class_weights` 🆕 | (1.0, 2.0, 4.0) — BEST_EFFORT/SOFT_RT/HARD_RT |
+| `response_weight` 🆕 | 1.5 — 아직 시작 안 한 task 가중(응답성) |
 
 **1) CPU burst 종료 시 (`EVENT_SHAPED` 기준):**
 $$R_i = \underbrace{w_p \cdot \tfrac{\text{work}}{\text{work\_norm}}}_{\text{progress}} - \lambda_E R_{\text{energy}} - \lambda_S R_{\text{starv}} \;(+\; \text{완료 시 completion 항})$$
@@ -295,6 +320,25 @@ $$R_i \mathrel{+}= \text{completion} + w_{cw}\cdot\tfrac{\text{total\_work}}{\te
 > 🔧 **[구현 반영]** 추가 정규화 2종:
 > - **Team reward:** 각 step 보상을 에이전트 수로 나눠 공유(commit `team reward`).
 > - **`reward_scale`** (trainer 기본 0.01): advantage 계산 전 보상 스케일 다운으로 value 분산 완화.
+
+### 5.3.1 🆕 `LATENCY_FLOW` — 지연 중심 보상 (채택, commit `3a59102`)
+
+**채점 기준 정합:** 본 프로젝트의 평가 주축은 **지연(turnaround/response) 최소화**이며, **baseline(SJF/EAS) 대비 상대 우위**로 채점한다. 위 `EVENT_*` 모드는 이 축과 잘 맞지 않아 두 가지 퇴화(degenerate) 문제가 있었다:
+
+1. **cost-only 구성은 "idle이 공짜":** 비용 항(energy/starvation)이 **burst 실행 중에만** 부과돼, 아무 것도 디스패치하지 않으면 비용이 0 → reward 0이 전역 최적. (측정: NoOp 에피소드 reward = 정확히 0)
+2. **completion 보너스 구성은 품질을 압도:** 완료 보너스가 커서 32개를 끝내는 모든 정책이 비슷한 점수로 뭉침 → 좋은/나쁜 스케줄을 거의 변별 못 함.
+
+**해법(채택):** *우선순위 가중 체류시간(priority-weighted flow time)*. 매 스텝 전진한 `Δt`에 대해
+$$R_{\text{step}} = -\,\Delta t \cdot \sum_{i:\ \text{도착·미완료}} w(\text{class}_i)\cdot \big[\text{미시작이면} \times w_{\text{resp}}\big]\;-\;\lambda_C \cdot (\text{선점 수})\cdot \text{cs\_cost}$$
+- `w(class)` = `latency_class_weights` = (1, 2, 4) — HARD-RT가 4배.
+- 에피소드 합 = $-\sum_i w_i \cdot \text{turnaround}_i$ → **reward 최대화 = 우선순위 가중 평균 turnaround 최소화** = 채점축 그 자체.
+- **idle이 절대 공짜가 아님**(대기 task가 매 스텝 패널티) → degenerate idle 최적 제거.
+- 느린/부적합 코어 배정 → runtime↑ → 체류↑ → 패널티↑로 **이종 코어 배치가 자동 반영**(에너지는 runtime 통해 간접).
+- **dense**(매 스텝) → credit assignment 양호. 구현상 합성 `finished_run` 이벤트로 emit해 time-scaled GAE 경로에 그대로 실림(`_charge_flow_time`).
+
+**검증(정책 무관 측정, P2E2·BALANCED):** NoOp `-34557`(idle 대참사) ≪ Random `-994` < FirstValid `-1039`... 가 아니라 **SJF `-759` < Random `-994` < FirstValid `-1039`** 순으로 **SJF가 뚜렷이 최고**. 정책 간 격차 ~280으로 강하게 변별(이전 cost-only는 ~20 내 뭉침).
+
+**CLI:** `--reward-mode latency_flow --lambda-flow 1.0 --response-weight 1.5 --lambda-energy 0 --lambda-context-switch 3` (§실행 코드).
 
 ### 5.4 시간 스케일 GAE
 
@@ -357,7 +401,7 @@ $$\delta_i^{(t)} = R_i^{(t)} + \gamma^{\Delta t_i^{(t)}} V(s_{t+1}) - V(s_t)$$
 |---|---|---|
 | Reward scale 환경 간 차이 | PopArt/running-stats normalization | ⚠️ 미구현 (현재 `reward_scale` 상수만) |
 | Value function 분산 | PPO value clipping | ✅ clip_ratio·grad clip 존재 |
-| 표본 효율 | 16~32 env 병렬 rollout | ⚠️ 현재 순차(`rollout-episodes` 단순 반복) |
+| 표본 효율 | 16~32 env 병렬 rollout | 🔧 **부분 구현** — `--rollout-workers N`(멀티프로세스, spawn). 워커는 CPU 추론, 메인은 GPU update |
 | 학습 곡선 noise | 5 seeds, CI 보고 | ⚠️ 평가 단계 |
 | LP-E 결정 빈도 보정 | 타입별 transition 가중 | ⚠️ 미구현 |
 
@@ -385,6 +429,25 @@ $$\delta_i^{(t)} = R_i^{(t)} + \gamma^{\Delta t_i^{(t)}} V(s_{t+1}) - V(s_t)$$
 > - mean / per-core utilization
 >
 > Pareto Front(Throughput–Energy–Latency 3축) 시각화는 분석 스크립트 수준에서 추가 예정.
+
+### 8.4 🆕 단일 구성 학습 결과 (P2E2·BALANCED, `LATENCY_FLOW`, 6/5)
+
+> SJF imitation warm-start → `--reward-mode latency_flow`로 200 ep 학습. deterministic eval 보상(=가중 체류시간, 0에 가까울수록 좋음):
+
+| ep | eval reward | done | preempt | 비고 |
+|---|---:|---:|---:|---|
+| 1–30 | ~`-34000` | 0–3 | ~0 | warm-start의 idle argmax에 갇힘(회복 구간) |
+| 80 | `-8999` | 22 | 26 | 디스패치 학습, 선점 과다 |
+| **140** | `-803.7` | **32/32** | 12 | **전 작업 완료 돌파** |
+| 170 | `-748.9` | 32 | 10 | **EAS 추월** |
+| **190 (best)** | **`-729.6`** | 32 | 10 | **SJF 추월** |
+| 200 | `-734.6` | 32 | 11 | 수렴 |
+
+**baseline:** Random `-955.8` · EAS `-848.2` · SJF `-745.9`.
+
+→ **학습된 정책(best `-729.6`)이 SJF를 ~16pt, EAS를 ~118pt 앞선다.** ep170–200 내내 SJF 이하로 일관 → 노이즈 아닌 실재 우위(margin ~2%로 얇음). 정책은 순수 SJF(항상 첫 슬롯)가 아니라 **이종 코어 배치 + 선택적 선점**(`context_switch=3`으로 선점 ~10/ep에 안착)으로 SJF급 지연을 달성한다.
+
+> ⚠️ **[후반 불안정 — on-policy RL 전형]** 300ep까지 양호하다가 **~450ep에서 성능 하락(policy drift)** 관측. 원인: 고정 `entropy_coef`가 수렴한 정책을 계속 교란 + LR 감쇠 부재. **대응:** 학습 루프가 `best.pt`를 eval 최고점 기준으로 저장하므로 **최종 산출물은 `best.pt`**를 사용(사실상 early-stopping). 긴 학습 안정화를 위한 **LR/entropy 감쇠**는 후속 TODO.
 
 ---
 
@@ -417,7 +480,8 @@ $$\delta_i^{(t)} = R_i^{(t)} + \gamma^{\Delta t_i^{(t)}} V(s_{t+1}) - V(s_t)$$
 대응: Layer 4 obs 확장 → Hierarchical policy → MoE. *(domain randomization 구현 후 검증 가능)*
 
 ### 시나리오 B — 학습 자체가 진행 안 됨
-> 🔧 **[선제 대응 반영]** SJF imitation warm-start, reward 정규화(starvation log화, team reward, reward_scale)가 이미 이 위험을 겨냥해 도입됨. *(NO-OP은 비활성→활성으로 바뀌었으므로, 학습이 NO-OP에 갇히는지 모니터링 필요.)* 추가로 curriculum Stage 1 비중 확대 예정.
+> 🔧 **[선제 대응 반영]** SJF imitation warm-start, reward 정규화(starvation log화, team reward, reward_scale)가 이미 이 위험을 겨냥해 도입됨.
+> ✅ **[실제 발생 → 해소]** NO-OP 활성 + cost-only 보상에서 **정책이 "아무것도 안 하기"로 붕괴**하는 현상이 실제로 관측됨(idle = reward 0이 전역 최적). **`LATENCY_FLOW` 보상으로 근본 해소**(§5.3.1) — idle이 더 이상 공짜가 아니라 학습이 정상 진행되어 baseline을 추월(§8.4).
 
 ### 시나리오 C — OOD(N=16,20) 성능 폭락
 대응: 솔직 보고, 학습 범위 내 generalization만 claim.
@@ -429,21 +493,22 @@ $$\delta_i^{(t)} = R_i^{(t)} + \gamma^{\Delta t_i^{(t)}} V(s_{t+1}) - V(s_t)$$
 
 ## 11. 단계별 마일스톤 — 진척 반영
 
-> 🔧 **[구현 반영]** 커밋 로그(`48ab639`~`ac22ca6`, 2026-05-18 ~ 06-03) 기준 현재 진척:
+> 🔧 **[구현 반영]** 커밋 로그(`48ab639`~`f40e60e`, 2026-05-18 ~ 06-05) 기준 현재 진척:
 
 | 주차 | 목표 | 상태 |
 |---|---|---|
 | W1–W2 | 환경 골격 (이산 이벤트 시뮬레이터, core/task 클래스) | ✅ 완료 (SimPy 기반, Global Queue) |
 | W3 | Reward 단위 테스트, 휴리스틱 baseline 3종 | ✅ 완료 (+Random 포함 4종, tests/ 다수) |
 | W4 | Stochastic generator + replay + 평가 trace 세트 | 🔧 **부분** — generator 완료, **replay/trace 세트 미구현** |
-| W5–W6 | Single-config ACAC 학습 (P2E2 sanity) | 🔧 **진행 중** — rollout/trainer/GAE/imitation 구현, 학습 튜닝 단계 |
+| W5–W6 | Single-config ACAC 학습 (P2E2 sanity) | ✅ **성공** — **학습 정책이 SJF·EAS 추월**(§8.4) |
 | (6/3 패치) | **선점(preemption) + NO-OP 활성 + burst 비노출** | ✅ **완료** — env+RL 활성화, 테스트 통과 |
+| (6/4–6/5) | **GPU 가속·병렬 롤아웃·idle spin 수정 + `LATENCY_FLOW` 보상 재설계** | ✅ **완료** — 채점축 정렬, baseline 추월 달성 |
 | W7 | Domain randomization 인프라 (병렬 env, curriculum) | ⬜ 미착수 |
 | W8–W10 | Domain randomization 학습 + ablation | ⬜ 미착수 |
 | W11 | 평가 grid 전체 실행, 분석 | ⬜ 미착수 |
 | W12 | 결과 정리, 리포트 | ⬜ 미착수 |
 
-> 🆕 계획 외 추가 작업: SJF imitation 사전학습, 3종 reward mode, joint macro-timeline critic, team reward/정규화, **선점·부분 burst·CS 비용·NO-OP 학습**.
+> 🆕 계획 외 추가 작업: SJF imitation 사전학습, **4종 reward mode(+`LATENCY_FLOW`)**, joint macro-timeline critic, team reward/정규화, 선점·부분 burst·CS 비용·NO-OP 학습, **GPU 가속·병렬 롤아웃·preemption 로깅**.
 
 ---
 
@@ -485,8 +550,12 @@ $$\delta_i^{(t)} = R_i^{(t)} + \gamma^{\Delta t_i^{(t)}} V(s_{t+1}) - V(s_t)$$
 - ~~**B. Context-switch 페널티를 reward에 실제 반영할 위치/방식.**~~ → ✅ **선점 전환 시 적용**(전환 유발 코어에 `λ_C × cs_cost`).
 - ~~**C. Preemption action을 언제 도입할지.**~~ → ✅ **구현**(M2 interruptible-options, P1/P3 게이트, `enable_preemption` 기본 on).
 
+**해소됨 (6/4–6/5)**
+- ~~**E. 채점축(지연·상대평가)에 맞는 reward 형태.**~~ → ✅ **`LATENCY_FLOW` 채택**(§5.3.1). cost-only의 idle-free·completion-swamp 결함을 우선순위 가중 체류시간으로 해소, baseline 추월.
+
 **남은 질문**
 - **D. Replay trace 세트 포맷·생성 시점.** (평가 grid 전 필수 — §4.2) ⚠️ 미해결.
+- **F. 후반 학습 안정화(§8.4).** ~450ep policy drift → LR/entropy 감쇠·early-stop 도입 여부(현재 `best.pt` 보존으로 우회). ⚠️ 미해결.
 - (선점 후속) min_run / starvation_threshold 등 게이트 하이퍼파라미터 튜닝, EAS misfit(P2) affinity 이주 추가 여부.
 
 **기존 질문(유지)**
@@ -495,6 +564,69 @@ $$\delta_i^{(t)} = R_i^{(t)} + \gamma^{\Delta t_i^{(t)}} V(s_{t+1}) - V(s_t)$$
 3. Multi-phase task를 1차/ablation 중 어디에. *(→ 현재 multi-phase는 이미 1차 환경에 구현됨; ablation 대상은 phase 수/IO 모델)*
 4. Reward 가중치를 학습 가능 hyper-param으로 둘지.
 5. Specialist baseline을 12개 전부/대표 4~5개 중 어디까지 학습할지.
+
+---
+
+## 15. 🆕 실행 코드 (재현 방법)
+
+> Colab(GPU 권장) 기준. 로컬에선 `python -m ...`. 작업 디렉터리 = repo 루트.
+
+### 15.0 테스트 (선택)
+```bash
+pytest -q          # 49 passed, 2 skipped(torch 네트워크는 torch 환경에서만)
+```
+
+### 15.1 Step 1 — SJF imitation warm-start
+> 액터를 SJF 결정으로 사전학습. **RL과 `--hidden-dim`이 같아야** 가중치 로드 가능.
+```bash
+python -m src.train_sjf_imitation \
+  --hidden-dim 128 --arrival-rate 1.0 --episode-time 40 --max-tasks 32 \
+  --device cuda
+# → outputs/sjf_imitation/actors.pt
+```
+
+### 15.2 Step 2 — 본 학습 (지연 보상, 채택 설정)
+> 이 명령으로 SJF·EAS를 추월한 결과(§8.4)를 재현.
+```bash
+python -m src.train_acac \
+  --reward-mode latency_flow \
+  --lambda-flow 1.0 --response-weight 1.5 --lambda-energy 0 \
+  --lambda-context-switch 3 \
+  --episodes 300 --eval-every 10 --eval-episodes 10 --seed 3 \
+  --arrival-rate 1.0 --episode-time 40 --max-tasks 32 \
+  --hidden-dim 128 --rollout-episodes 16 \
+  --pretrained-actors outputs/sjf_imitation/actors.pt \
+  --clip-ratio 0.2 --entropy-coef 0.01 --update-epochs 4 \
+  --rollout-workers 2 --device cuda \
+  --output-dir outputs/acac_flow
+# 최종 산출물: outputs/acac_flow/best.pt (eval 최고점)
+```
+- **읽는 법:** `LATENCY_FLOW` reward는 음수(체류시간 비용) → **0에 가까울수록 좋음**. eval 줄의 `base | sjf ≈ -746`보다 위로 올라가면 SJF 추월.
+- `--episodes`는 300 권장(450+에서 후반 drift, §8.4). 더 길게 돌릴 땐 `best.pt` 사용.
+
+### 15.3 Ablation / 옵션
+```bash
+# 비선점 ablation (선점 유/무 비교)
+python -m src.train_acac ... --disable-preemption --output-dir outputs/acac_flow_nopre
+
+# 커리큘럼: 비선점으로 먼저 SJF 근접 → 선점 켜고 이어 학습
+python -m src.train_acac ... --disable-preemption --output-dir outputs/acac_phase1
+python -m src.train_acac ... --resume outputs/acac_phase1/latest.pt --output-dir outputs/acac_phase2
+
+# 보상 모드 비교 (구 cost-only 등)
+python -m src.train_acac ... --reward-mode event_shaped --completion 5 --completion-work 5 ...
+```
+
+### 15.4 주요 플래그 요약
+| 플래그 | 의미 | 권장 |
+|---|---|---|
+| `--reward-mode` | `latency_flow`(채택)/event_shaped/event_cost/completion_only | `latency_flow` |
+| `--lambda-flow` | 체류시간 패널티 가중 | 1.0 |
+| `--response-weight` | 미시작 task 가중(응답성) | 1.5 |
+| `--lambda-context-switch` | 선점 페널티(thrashing 억제) | 3 (선점 과다 시 ↑) |
+| `--rollout-workers` | 병렬 롤아웃 프로세스 수 | 2 (Colab vCPU 2) |
+| `--device` | `auto`/`cpu`/`cuda` | `auto` |
+| `--disable-preemption` | 비선점 ablation | (비교 실험 시) |
 
 ---
 
@@ -516,4 +648,10 @@ $$\delta_i^{(t)} = R_i^{(t)} + \gamma^{\Delta t_i^{(t)}} V(s_{t+1}) - V(s_t)$$
 - **item 2** NO-OP 활성(`allow_noop=True`) + 학습 transition 기록.
 - **item 3** preemption 구현(M2, wakeup P1/P3+min_run 게이트, 부분 burst, CS 비용). self obs 5→8(현재 task 노출).
 
-*문서 끝. (기준 커밋 `ac22ca6`, 2026-06-03)*
+### 06/04–06/05 (학습 인프라 + 보상 재설계)
+- **학습 인프라:** forward 배칭·eval 캐싱으로 GPU 가속(`78b1174`), idle 무한 spin 수정 + 병렬 롤아웃(`3a8f2f8`), preemption 카운트 로깅(`502f89d`), 단일 코어 obs 버그 수정(`f40e60e`).
+- **보상 진단:** cost-only는 **idle이 공짜**(NoOp reward=0), completion-heavy는 **품질 변별 안 됨** → 둘 다 퇴화 확인. 선점 비용(context-switch)이 baseline(비선점) 대비 RL을 불리하게 만든 점도 진단(preempt 로깅으로 가시화).
+- **보상 재설계:** 채점축(지연·SJF 상대)에 맞춰 **`LATENCY_FLOW`(우선순위 가중 체류시간) 채택**(`3a59102`).
+- **결과:** P2E2·BALANCED에서 학습 정책이 **SJF·EAS 추월**(best `-729.6` vs SJF `-745.9`). ~450ep 후반 drift는 `best.pt`로 우회.
+
+*문서 끝. (기준 커밋 `f40e60e`, 2026-06-05)*
