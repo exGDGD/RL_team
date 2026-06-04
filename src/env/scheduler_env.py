@@ -722,7 +722,10 @@ class SchedulerEnv:
             ),
             "ready_queue": ready_features,
             "ready_mask": ready_mask,
-            "other_cores": np.array(other_core_features, dtype=np.float32),
+            # reshape keeps the feature axis even with zero other cores
+            # (single-core configs): empty -> (0, 3), not (0,). Otherwise the
+            # downstream encoder gets a (N, 0) matrix and the Linear fails.
+            "other_cores": np.array(other_core_features, dtype=np.float32).reshape(-1, 3),
             "system": np.concatenate(
                 [
                     np.array([len(self.cores), utilization], dtype=np.float32),
