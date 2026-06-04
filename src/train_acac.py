@@ -55,6 +55,35 @@ def main() -> None:
     parser.add_argument("--lambda-starvation", type=float, default=0.05)
     parser.add_argument("--lambda-latency", type=float, default=0.5)
     parser.add_argument("--starvation-max-wait-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--reward-mode",
+        type=str,
+        default="event_shaped",
+        choices=["event_shaped", "event_cost", "completion_only", "latency_flow"],
+        help=(
+            "Reward formulation. 'latency_flow' = priority-weighted flow-time "
+            "(dense per-step turnaround penalty; idle is never free). Recommended "
+            "for a latency objective."
+        ),
+    )
+    parser.add_argument(
+        "--lambda-flow",
+        type=float,
+        default=1.0,
+        help="LATENCY_FLOW: priority-weighted flow-time penalty weight.",
+    )
+    parser.add_argument(
+        "--lambda-context-switch",
+        type=float,
+        default=1.0,
+        help="Context-switch (preemption) penalty weight. Raise to discourage thrashing.",
+    )
+    parser.add_argument(
+        "--response-weight",
+        type=float,
+        default=1.5,
+        help="LATENCY_FLOW: extra weight while a task still waits for its first run.",
+    )
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--reward-scale", type=float, default=0.01)
     parser.add_argument("--actor-learning-rate", type=float, default=3.0e-4)
@@ -292,6 +321,7 @@ def rollout_env_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "max_tasks": args.max_tasks,
         "reward_weights": reward_weights_from_args(args),
         "enable_preemption": getattr(args, "enable_preemption", False),
+        "reward_mode": getattr(args, "reward_mode", "event_shaped"),
     }
 
 
@@ -390,6 +420,9 @@ def reward_weights_from_args(args: argparse.Namespace) -> RewardWeights:
         starvation=getattr(args, "lambda_starvation", 0.05),
         latency=getattr(args, "lambda_latency", 0.5),
         starvation_max_wait_weight=getattr(args, "starvation_max_wait_weight", 0.5),
+        flow_time=getattr(args, "lambda_flow", 1.0),
+        context_switch=getattr(args, "lambda_context_switch", 1.0),
+        response_weight=getattr(args, "response_weight", 1.5),
     )
 
 
@@ -447,6 +480,10 @@ def cached_evaluate_baselines(
         getattr(args, "lambda_starvation", 0.05),
         getattr(args, "lambda_latency", 0.5),
         getattr(args, "starvation_max_wait_weight", 0.5),
+        getattr(args, "reward_mode", "event_shaped"),
+        getattr(args, "lambda_flow", 1.0),
+        getattr(args, "lambda_context_switch", 1.0),
+        getattr(args, "response_weight", 1.5),
     )
     cached = _BASELINE_CACHE.get(key)
     if cached is None:

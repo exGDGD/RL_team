@@ -33,12 +33,25 @@ class RewardWeights:
     context_switch: float = 1.0
     work_norm: float = 10.0
     starvation_max_wait_weight: float = 0.5
+    # LATENCY_FLOW mode: per-unit-time penalty for every task that has arrived
+    # but not finished (priority-weighted). Its episode sum equals the priority-
+    # weighted mean turnaround, the latency objective.
+    flow_time: float = 1.0
+    # Per-class multiplier indexed by LatencyClass (BEST_EFFORT, SOFT_RT, HARD_RT).
+    latency_class_weights: tuple[float, float, float] = (1.0, 2.0, 4.0)
+    # Extra multiplier while a task is still waiting for its first run (targets
+    # response time on top of turnaround).
+    response_weight: float = 1.5
 
 
 class RewardMode(str, Enum):
     EVENT_SHAPED = "event_shaped"
     EVENT_COST = "event_cost"
     COMPLETION_ONLY = "completion_only"
+    # Priority-weighted flow time: dense per-step penalty proportional to the
+    # number of unfinished in-system tasks (weighted by latency class). Idle is
+    # never free because waiting tasks bleed reward every step.
+    LATENCY_FLOW = "latency_flow"
 
 
 class SchedulerEnv:
@@ -164,12 +177,14 @@ class SchedulerEnv:
         dict[str, Any],
     ]:
         self._last_rewards = {agent: 0.0 for agent in self.agents}
+        interval_start = self.sim.now
         self._last_step_info = self._resolve_and_dispatch(actions)
 
         # If no core changed assignment (everyone kept / NO-OP) we must force
         # simulated time forward, otherwise the same decision point repeats.
         made_change = bool(self._last_step_info["assignments"])
         self._advance_to_decision(force_progress=not made_change)
+        self._charge_flow_time(interval_start)
         terminated = self._terminated()
         truncated = (not terminated) and self._truncated()
         terminations = {agent: terminated for agent in self.agents}
@@ -470,6 +485,9 @@ class SchedulerEnv:
         starvation_cost: float,
     ) -> float:
         weights = self.reward_weights
+        if self.reward_mode == RewardMode.LATENCY_FLOW:
+            # Latency is charged per-step in step(); a burst only books energy.
+            return -weights.energy * energy_cost
         event_cost = -weights.energy * energy_cost - weights.starvation * starvation_cost
         if self.reward_mode == RewardMode.EVENT_SHAPED:
             return weights.progress_work * self._normalized_work(cpu_work_done) + event_cost
@@ -543,6 +561,10 @@ class SchedulerEnv:
         starvation_cost: float,
     ) -> float:
         weights = self.reward_weights
+        if self.reward_mode == RewardMode.LATENCY_FLOW:
+            # Latency/turnaround is charged densely per-step in step(); the burst
+            # event itself only books energy (no completion bonus to swamp it).
+            return -weights.energy * energy_cost
         latency_cost = 0.0
         if task.done and task.turnaround_time() is not None:
             latency_cost = float(task.latency_class) * task.turnaround_time()
@@ -576,6 +598,56 @@ class SchedulerEnv:
 
     def _normalized_work(self, work: float) -> float:
         return float(work / max(self.reward_weights.work_norm, 1e-8))
+
+    def _flow_time_penalty(self, dt: float) -> float:
+        """Priority-weighted count of unfinished in-system tasks times elapsed
+        time. Summed over an episode this equals the priority-weighted total
+        flow time (turnaround), with an extra multiplier while a task is still
+        waiting for its first run (response-time emphasis). Idle is never free:
+        every queued task keeps accruing this penalty each step."""
+
+        if dt <= 0.0:
+            return 0.0
+        weights = self.reward_weights
+        class_weights = weights.latency_class_weights
+        now = self.sim.now
+        total = 0.0
+        for task in self.tasks.values():
+            if task.done or task.arrival_time > now:
+                continue
+            weight = class_weights[int(task.latency_class)]
+            if task.first_started_at is None:
+                weight *= weights.response_weight
+            total += weight
+        return weights.flow_time * total * dt
+
+    def _charge_flow_time(self, interval_start: float) -> None:
+        """Apply the LATENCY_FLOW per-step penalty for the elapsed interval.
+
+        The penalty is split across agents for the episode-total channel and
+        also emitted as a synthetic finished-run reward event so it reaches the
+        per-transition learning signal (which is driven by reward events, not
+        the step-level team reward, on any step where a burst also finished).
+        """
+
+        if self.reward_mode != RewardMode.LATENCY_FLOW:
+            return
+        penalty = self._flow_time_penalty(self.sim.now - interval_start)
+        if penalty <= 0.0 or not self.agents:
+            return
+        share = penalty / len(self.agents)
+        for agent in self.agents:
+            self._last_rewards[agent] -= share
+        self._last_step_info["finished_runs"].append(
+            {
+                "core_id": "__flow__",
+                "pid": -1,
+                "time": self.sim.now,
+                "run_time": 0.0,
+                "reward": -penalty,
+                "task_done": False,
+            }
+        )
 
     def _observe_agent(self, agent_id: str) -> dict[str, Any]:
         core = self.cores[agent_id]
