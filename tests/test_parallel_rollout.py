@@ -10,7 +10,19 @@ from argparse import Namespace
 
 from src.rl import RolloutBuffer, collect_episode
 from src.train_acac import collect_training_rollout, make_env, rollout_seeds
-from tests.test_rl_rollout import FirstValidPolicy
+
+
+class FirstValidPolicy:
+    def act(self, batch):
+        actions = {}
+        log_probs = {}
+        for row, agent_id in enumerate(batch.agent_ids):
+            valid = [
+                idx for idx, is_valid in enumerate(batch.action_mask[row]) if idx > 0 and is_valid
+            ]
+            actions[agent_id] = valid[0] if bool(batch.decision_mask[row]) and valid else 0
+            log_probs[agent_id] = 0.0
+        return actions, log_probs
 
 
 def _args() -> Namespace:

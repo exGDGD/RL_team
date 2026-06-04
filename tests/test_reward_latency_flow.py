@@ -11,7 +11,27 @@ import pytest
 from src.env import CoreType, RewardWeights, SchedulerEnv, WorkloadScenario
 from src.baselines import RandomPolicy, SJFLikePolicy, run_episode
 from src.rl import collect_episode
-from tests.test_rl_rollout import FirstValidPolicy, NoOpPolicy
+
+
+class NoOpPolicy:
+    def act(self, batch):
+        return (
+            {agent_id: 0 for agent_id in batch.agent_ids},
+            {agent_id: 0.0 for agent_id in batch.agent_ids},
+        )
+
+
+class FirstValidPolicy:
+    def act(self, batch):
+        actions = {}
+        log_probs = {}
+        for row, agent_id in enumerate(batch.agent_ids):
+            valid = [
+                idx for idx, is_valid in enumerate(batch.action_mask[row]) if idx > 0 and is_valid
+            ]
+            actions[agent_id] = valid[0] if bool(batch.decision_mask[row]) and valid else 0
+            log_probs[agent_id] = 0.0
+        return actions, log_probs
 
 
 def _make(seed: int, **weight_overrides) -> SchedulerEnv:
