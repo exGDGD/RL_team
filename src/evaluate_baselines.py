@@ -7,6 +7,7 @@ import numpy as np
 
 from src.baselines import (
     EASLikePolicy,
+    MLFQPolicy,
     RandomPolicy,
     RoundRobinPolicy,
     SJFLikePolicy,
@@ -35,6 +36,7 @@ def main() -> None:
     policies = [
         RandomPolicy(seed=0),
         RoundRobinPolicy(),
+        MLFQPolicy(),
         SJFLikePolicy(),
         EASLikePolicy(),
     ]

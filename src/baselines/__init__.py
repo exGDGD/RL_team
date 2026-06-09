@@ -3,6 +3,7 @@
 from .policies import (
     BaselinePolicy,
     EASLikePolicy,
+    MLFQPolicy,
     RandomPolicy,
     RoundRobinPolicy,
     SJFLikePolicy,
@@ -13,6 +14,7 @@ __all__ = [
     "BaselinePolicy",
     "EASLikePolicy",
     "EpisodeResult",
+    "MLFQPolicy",
     "RandomPolicy",
     "RoundRobinPolicy",
     "SJFLikePolicy",

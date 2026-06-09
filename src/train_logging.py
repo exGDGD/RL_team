@@ -109,8 +109,9 @@ def log_episode_eval(eval_summary: dict[str, Any]) -> None:
         eval_summary["sampled"]["actions"]["first_slot_fraction"],
     )
     logger.info(
-        "       base | random %+.3f  sjf %+.3f  eas %+.3f",
+        "       base | random %+.3f  mlfq %+.3f  sjf %+.3f  eas %+.3f",
         _baseline_reward(baselines, "random"),
+        _baseline_reward(baselines, "mlfq"),
         _baseline_reward(baselines, "sjf_like"),
         _baseline_reward(baselines, "eas_like"),
     )
