@@ -57,6 +57,8 @@ def collect_episode(
             if task_choices <= 1:
                 buffer.forced_decisions += 1
             action = int(chosen_actions.get(agent_id, 0))
+            if action == 0:
+                buffer.noop_decisions += 1
             is_busy = bool(batch.self_features[agent_index, 1] == 1.0)
             decision = PendingDecision(
                 agent_id=agent_id,

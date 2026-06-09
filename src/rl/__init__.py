@@ -12,6 +12,7 @@ from .buffer import (
     AgentTransition,
     JointMacroTransition,
     PendingDecision,
+    ReplayBuffer,
     RolloutBuffer,
     compute_time_scaled_gae,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "JointMacroTransition",
     "ImitationExample",
     "PendingDecision",
+    "ReplayBuffer",
     "RolloutBuffer",
     "RolloutPolicy",
     "agents_by_core_type",

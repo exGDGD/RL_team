@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -67,6 +68,7 @@ class RolloutBuffer:
     preemptions: int = 0
     decisions: int = 0
     forced_decisions: int = 0
+    noop_decisions: int = 0
     total_task_choices: int = 0
     max_task_choices: int = 0
 
@@ -101,6 +103,7 @@ class RolloutBuffer:
         self.preemptions += other.preemptions
         self.decisions += other.decisions
         self.forced_decisions += other.forced_decisions
+        self.noop_decisions += other.noop_decisions
         self.total_task_choices += other.total_task_choices
         self.max_task_choices = max(self.max_task_choices, other.max_task_choices)
 
@@ -115,6 +118,13 @@ class RolloutBuffer:
         if self.decisions == 0:
             return 0.0
         return self.forced_decisions / self.decisions
+
+    @property
+    def noop_fraction(self) -> float:
+        """Share of decisions where the agent chose NO-OP (action 0)."""
+        if self.decisions == 0:
+            return 0.0
+        return self.noop_decisions / self.decisions
 
     def clear(self) -> None:
         self.transitions.clear()
@@ -165,3 +175,42 @@ def _ensure_same_shape(*arrays: np.ndarray) -> None:
     shapes = {array.shape for array in arrays}
     if len(shapes) != 1:
         raise ValueError(f"All arrays must have the same shape, got {sorted(shapes)}")
+
+
+class ReplayBuffer:
+    """A small FIFO of recent rollouts reused alongside the current one.
+
+    ACAC is on-policy, so reuse is bounded: only the last ``capacity`` rollouts
+    are kept and the PPO clipped ratio (computed against each transition's stored
+    ``log_prob``) provides the importance correction for the mild off-policyness.
+    ``capacity=0`` disables replay and ``combined`` just returns the current
+    rollout, so training behaviour is unchanged by default.
+    """
+
+    def __init__(self, capacity: int = 0) -> None:
+        if capacity < 0:
+            raise ValueError(f"capacity must be >= 0, got {capacity}")
+        self.capacity = capacity
+        self._buffers: deque[RolloutBuffer] = deque(maxlen=capacity or None)
+
+    def __len__(self) -> int:
+        return len(self._buffers)
+
+    def add(self, rollout: RolloutBuffer) -> None:
+        """Store a rollout for reuse in later updates (no-op when disabled)."""
+        if self.capacity == 0:
+            return
+        self._buffers.append(rollout)
+
+    def combined(self, current: RolloutBuffer) -> RolloutBuffer:
+        """Merge the current rollout with the retained ones into a fresh buffer.
+
+        ``RolloutBuffer.extend`` re-offsets episode and joint indices, so the
+        merged buffer keeps every episode's credit assignment self-contained.
+        The current rollout is appended first to preserve its diagnostics order.
+        """
+        merged = RolloutBuffer()
+        merged.extend(current)
+        for past in self._buffers:
+            merged.extend(past)
+        return merged

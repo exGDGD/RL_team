@@ -271,6 +271,13 @@ python -m src.train_acac \
 3. 구현/테스트 후 필요한 파일만 commit합니다.
 4. `.venv`, generated trace, training output은 commit하지 않습니다.
 
+## TODO
+
+- [x] entropy를 학습 진행에 따라 줄여가며(annealing) 학습 — `--entropy-coef`(시작) → `--entropy-coef-final`을 `--entropy-anneal-episodes`에 걸쳐 선형 감쇠 (후반 policy drift 완화)
+- [x] mini-batch + replay buffer 추가 — `--num-minibatches`(매크로 인터벌 단위 minibatch SGD), `--replay-capacity`(최근 롤아웃 재사용; PPO clip이 staleness 보정). 둘 다 기본값은 기존 동작 유지
+- [x] no-op 선택 횟수 로그 추가 — 콘솔 `noop N (frac)` + `metrics.jsonl`의 `noop_decisions`/`noop_fraction`
+- [x] transition 수 출력 — 콘솔 `trans T/J` (transition 수 / joint interval 수), `metrics.jsonl`엔 기존부터 기록됨
+
 ## notes
 Main experiment v0(현재 버전):
   Global ready queue

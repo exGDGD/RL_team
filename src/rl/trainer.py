@@ -33,6 +33,7 @@ class ACACConfig:
     critic_learning_rate: float = 3.0e-4
     allow_noop: bool = True
     update_epochs: int = 2
+    num_minibatches: int = 1
     reward_scale: float = 0.01
 
 
@@ -53,6 +54,7 @@ class UpdateStats:
     normalized_entropy: float
     ratio_std: float
     ratio_max_deviation: float
+    entropy_coef: float = 0.0
 
 
 class TorchACACPolicy(nn.Module):
@@ -172,14 +174,18 @@ class TorchACACPolicy(nn.Module):
             rows = []
             for position in positions:
                 transition = transitions[position]
-                tensors = transition_row_to_tensors(transition, self.device)
-                tensors["action_mask"] = torch.as_tensor(
+                raw = _raw_rows_to_tensors(
+                    transition.obs, [transition.agent_index], self.device
+                )
+                # Use the stored effective mask (post claimed-slot), not the raw
+                # batch mask, to match the action that was actually sampled.
+                raw["action_mask"] = torch.as_tensor(
                     transition.action_mask,
                     dtype=torch.bool,
                     device=self.device,
                 ).unsqueeze(0)
-                rows.append(tensors)
-            batched = _stack_tensor_dicts(rows)
+                rows.append(raw)
+            batched = normalize_observation_tensors(_stack_tensor_dicts(rows))
             logits = self.actors[core_type.value](**_actor_inputs(batched))
             dist = Categorical(logits=logits)
             chosen = torch.tensor(
@@ -241,14 +247,13 @@ class TorchACACPolicy(nn.Module):
             counts = []
             for position in positions:
                 batch = batches[position]
-                tensors = batch_rows_to_tensors(
-                    batch,
-                    list(range(batch.num_agents)),
-                    self.device,
+                rows.append(
+                    _raw_rows_to_tensors(
+                        batch, list(range(batch.num_agents)), self.device
+                    )
                 )
-                rows.append(tensors)
                 counts.append(batch.num_agents)
-            batched = _stack_tensor_dicts(rows)
+            batched = normalize_observation_tensors(_stack_tensor_dicts(rows))
             flat_values = self.critic(**_critic_inputs(batched))
             start = 0
             for offset, position in enumerate(positions):
@@ -299,8 +304,27 @@ class ACACTrainer:
                 },
             ]
         )
+        # Dedicated CPU generator so minibatch shuffling never perturbs the
+        # global torch RNG stream that the rollout's action sampling draws from
+        # (keeps seeded runs reproducible; full-batch updates are order-agnostic).
+        self._shuffle_rng = torch.Generator()
+        self._shuffle_rng.manual_seed(0)
 
-    def update(self, rollout: RolloutBuffer) -> UpdateStats:
+    def update(
+        self,
+        rollout: RolloutBuffer,
+        *,
+        entropy_coef: float | None = None,
+    ) -> UpdateStats:
+        """Run ``update_epochs`` passes over the rollout.
+
+        ``entropy_coef`` overrides ``config.entropy_coef`` for this update (the
+        training loop passes the annealed value); ``None`` keeps the config one.
+        With ``config.num_minibatches > 1`` each epoch is split into minibatch
+        SGD steps over the macro-timeline intervals (each minibatch carries both
+        its critic targets and the actor decisions credited to those intervals).
+        """
+
         transitions = rollout.transitions
         actor_transitions = [
             transition
@@ -312,6 +336,12 @@ class ACACTrainer:
             raise ValueError("Cannot update from an empty rollout buffer.")
         if not actor_transitions:
             raise ValueError("Rollout has no learnable actor transitions.")
+
+        coef = (
+            self.config.entropy_coef
+            if entropy_coef is None
+            else float(entropy_coef)
+        )
 
         with torch.no_grad():
             old_values = self.policy.values_for_joint_transitions(joint_transitions)
@@ -341,68 +371,39 @@ class ACACTrainer:
         returns_t = torch.tensor(joint_returns, dtype=torch.float32, device=self.policy.device)
         advantages_t = normalize_advantages(advantages_t)
 
-        epoch_stats = []
+        # Each learnable actor transition is credited to the macro-interval it
+        # started in (``joint_index``); grouping lets a minibatch of intervals
+        # gather its actor decisions in one indexable list.
+        actor_by_joint: dict[int, list[int]] = {}
+        for position, transition in enumerate(actor_transitions):
+            actor_by_joint.setdefault(transition.joint_index, []).append(position)
+
+        num_joint = len(joint_transitions)
+        num_minibatches = max(1, min(self.config.num_minibatches, num_joint))
+
+        step_stats: list[tuple[float, ...]] = []
         for _ in range(self.config.update_epochs):
-            new_log_probs, entropies = self.policy.evaluate_transitions(actor_transitions)
-            values = self.policy.evaluate_joint_transitions(joint_transitions)
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            clipped_ratio = torch.clamp(
-                ratio,
-                1.0 - self.config.clip_ratio,
-                1.0 + self.config.clip_ratio,
-            )
-            policy_loss = -torch.min(
-                ratio * advantages_t,
-                clipped_ratio * advantages_t,
-            ).mean()
-            value_loss = 0.5 * torch.mean((returns_t - values) ** 2)
-            entropy = entropies.mean()
-            normalized_entropy = normalize_entropy(
-                entropies=entropies,
-                transitions=actor_transitions,
-            )
-            loss = (
-                policy_loss
-                + self.config.value_coef * value_loss
-                - self.config.entropy_coef * entropy
-            )
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            actor_grad_norm = nn.utils.clip_grad_norm_(
-                self.policy.actors.parameters(),
-                self.config.max_grad_norm,
-            )
-            critic_grad_norm = nn.utils.clip_grad_norm_(
-                self.policy.critic.parameters(),
-                self.config.max_grad_norm,
-            )
-            self.optimizer.step()
-
-            with torch.no_grad():
-                approx_kl = (old_log_probs - new_log_probs).mean()
-                clip_fraction = (
-                    (torch.abs(ratio - 1.0) > self.config.clip_ratio)
-                    .float()
-                    .mean()
+            perm = torch.randperm(num_joint, generator=self._shuffle_rng).tolist()
+            for joint_idx in _chunk(perm, num_minibatches):
+                actor_idx = [
+                    position
+                    for joint_position in joint_idx
+                    for position in actor_by_joint.get(joint_position, [])
+                ]
+                stat = self._minibatch_step(
+                    actor_transitions=actor_transitions,
+                    joint_transitions=joint_transitions,
+                    actor_idx=actor_idx,
+                    joint_idx=joint_idx,
+                    old_log_probs=old_log_probs,
+                    advantages_t=advantages_t,
+                    returns_t=returns_t,
+                    entropy_coef=coef,
                 )
-            epoch_stats.append(
-                (
-                    loss.item(),
-                    policy_loss.item(),
-                    value_loss.item(),
-                    entropy.item(),
-                    approx_kl.item(),
-                    clip_fraction.item(),
-                    actor_grad_norm.item(),
-                    critic_grad_norm.item(),
-                    normalized_entropy.item(),
-                    ratio.std(unbiased=False).item(),
-                    torch.max(torch.abs(ratio - 1.0)).item(),
-                )
-            )
+                if stat is not None:
+                    step_stats.append(stat)
 
-        means = np.mean(epoch_stats, axis=0)
+        means = np.mean(step_stats, axis=0)
         return UpdateStats(
             actor_samples=len(actor_transitions),
             loss=float(means[0]),
@@ -419,6 +420,98 @@ class ACACTrainer:
             normalized_entropy=float(means[8]),
             ratio_std=float(means[9]),
             ratio_max_deviation=float(means[10]),
+            entropy_coef=float(coef),
+        )
+
+    def _minibatch_step(
+        self,
+        *,
+        actor_transitions: list[AgentTransition],
+        joint_transitions: list[JointMacroTransition],
+        actor_idx: list[int],
+        joint_idx: list[int],
+        old_log_probs: torch.Tensor,
+        advantages_t: torch.Tensor,
+        returns_t: torch.Tensor,
+        entropy_coef: float,
+    ) -> tuple[float, ...] | None:
+        """One optimizer step over a minibatch of macro-intervals.
+
+        Returns the per-step diagnostics, or ``None`` for a value-only minibatch
+        (no learnable actor decisions in these intervals) which still updates the
+        critic but has no policy statistics to report.
+        """
+
+        mb_joint = [joint_transitions[j] for j in joint_idx]
+        values = self.policy.evaluate_joint_transitions(mb_joint)
+        mb_returns = returns_t[joint_idx]
+        value_loss = 0.5 * torch.mean((mb_returns - values) ** 2)
+
+        has_actors = bool(actor_idx)
+        if has_actors:
+            mb_actor = [actor_transitions[p] for p in actor_idx]
+            new_log_probs, entropies = self.policy.evaluate_transitions(mb_actor)
+            mb_old_log_probs = old_log_probs[actor_idx]
+            mb_advantages = advantages_t[actor_idx]
+            ratio = torch.exp(new_log_probs - mb_old_log_probs)
+            clipped_ratio = torch.clamp(
+                ratio,
+                1.0 - self.config.clip_ratio,
+                1.0 + self.config.clip_ratio,
+            )
+            policy_loss = -torch.min(
+                ratio * mb_advantages,
+                clipped_ratio * mb_advantages,
+            ).mean()
+            entropy = entropies.mean()
+            normalized_entropy = normalize_entropy(
+                entropies=entropies,
+                transitions=mb_actor,
+            )
+        else:
+            policy_loss = torch.zeros((), device=self.policy.device)
+            entropy = torch.zeros((), device=self.policy.device)
+
+        loss = (
+            policy_loss
+            + self.config.value_coef * value_loss
+            - entropy_coef * entropy
+        )
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        actor_grad_norm = nn.utils.clip_grad_norm_(
+            self.policy.actors.parameters(),
+            self.config.max_grad_norm,
+        )
+        critic_grad_norm = nn.utils.clip_grad_norm_(
+            self.policy.critic.parameters(),
+            self.config.max_grad_norm,
+        )
+        self.optimizer.step()
+
+        if not has_actors:
+            return None
+
+        with torch.no_grad():
+            approx_kl = (mb_old_log_probs - new_log_probs).mean()
+            clip_fraction = (
+                (torch.abs(ratio - 1.0) > self.config.clip_ratio)
+                .float()
+                .mean()
+            )
+        return (
+            loss.item(),
+            policy_loss.item(),
+            value_loss.item(),
+            entropy.item(),
+            approx_kl.item(),
+            clip_fraction.item(),
+            actor_grad_norm.item(),
+            critic_grad_norm.item(),
+            normalized_entropy.item(),
+            ratio.std(unbiased=False).item(),
+            torch.max(torch.abs(ratio - 1.0)).item(),
         )
 
 
@@ -475,6 +568,19 @@ def map_actor_advantages(
     )
 
 
+def _chunk(items: list[int], num_chunks: int) -> list[list[int]]:
+    """Split ``items`` into up to ``num_chunks`` roughly equal contiguous parts.
+
+    Every item appears in exactly one part; empty parts are dropped. With
+    ``num_chunks == 1`` this returns ``[items]`` so a full-batch update is
+    numerically identical to the non-minibatched path.
+    """
+    if num_chunks <= 1 or len(items) <= 1:
+        return [items]
+    size = -(-len(items) // num_chunks)  # ceil division
+    return [items[start : start + size] for start in range(0, len(items), size)]
+
+
 def normalize_advantages(advantages: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
     if advantages.numel() <= 1:
         return advantages
@@ -505,13 +611,19 @@ def _stack_tensor_dicts(
     return {key: torch.cat([row[key] for row in rows], dim=0) for key in rows[0]}
 
 
-def batch_rows_to_tensors(
+def _raw_rows_to_tensors(
     batch: AgentBatch,
     rows: list[int],
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
+    """Gather the given agent rows into fresh, un-normalized tensors.
+
+    numpy fancy-indexing always copies, so the returned tensors never alias the
+    source ``AgentBatch`` — ``normalize_observation_tensors`` can mutate them in
+    place safely.
+    """
     index = np.asarray(rows, dtype=np.int64)
-    tensors = {
+    return {
         "self_features": torch.as_tensor(batch.self_features[index], dtype=torch.float32, device=device),
         "ready_queue": torch.as_tensor(batch.ready_queue[index], dtype=torch.float32, device=device),
         "ready_mask": torch.as_tensor(batch.ready_mask[index], dtype=torch.float32, device=device),
@@ -520,52 +632,49 @@ def batch_rows_to_tensors(
         "system": torch.as_tensor(batch.system[index], dtype=torch.float32, device=device),
         "action_mask": torch.as_tensor(batch.action_mask[index], dtype=torch.bool, device=device),
     }
-    return normalize_observation_tensors(tensors)
+
+
+def batch_rows_to_tensors(
+    batch: AgentBatch,
+    rows: list[int],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    return normalize_observation_tensors(_raw_rows_to_tensors(batch, rows, device))
 
 
 def normalize_observation_tensors(
     tensors: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Keep heterogeneous simulator features in a stable range for MLP inputs."""
+    """Keep heterogeneous simulator features in a stable range for MLP inputs.
 
-    tensors = dict(tensors)
-    self_features = tensors["self_features"].clone()
+    Mutates ``tensors`` in place — the builders above hand it freshly allocated
+    tensors. Every step is per-row independent, so normalizing a stacked batch
+    once is identical to normalizing each row then stacking; the update path
+    relies on this to batch many transitions through a single call.
+    """
+
+    self_features = tensors["self_features"]
     # self = [core_type, busy, elapsed, energy, dt_since,
     #         running_latency_class, running_cpu_intensity, running_cpu_progress]
-    self_features[:, 0] = self_features[:, 0] / max(len(CoreType) - 1, 1)
+    self_features[:, 0] /= max(len(CoreType) - 1, 1)
     self_features[:, 2:5] = torch.log1p(self_features[:, 2:5])
-    self_features[:, 5] = self_features[:, 5] / 2.0
+    self_features[:, 5] /= 2.0
     self_features[:, 7] = torch.log1p(self_features[:, 7])
-    tensors["self_features"] = self_features
 
-    ready_queue = tensors["ready_queue"].clone()
+    ready_queue = tensors["ready_queue"]
     # [waiting_time, cpu_progress, latency_class, cpu_intensity]
     ready_queue[:, :, 0:2] = torch.log1p(ready_queue[:, :, 0:2])
-    ready_queue[:, :, 2] = ready_queue[:, :, 2] / 2.0
-    tensors["ready_queue"] = ready_queue
+    ready_queue[:, :, 2] /= 2.0
 
-    other_cores = tensors["other_cores"].clone()
+    other_cores = tensors["other_cores"]
     if other_cores.shape[1] > 0:
-        other_cores[:, :, 0] = other_cores[:, :, 0] / max(len(CoreType) - 1, 1)
+        other_cores[:, :, 0] /= max(len(CoreType) - 1, 1)
         other_cores[:, :, 2] = torch.log1p(other_cores[:, :, 2])
-    tensors["other_cores"] = other_cores
 
-    system = tensors["system"].clone()
-    system[:, 0] = system[:, 0] / 12.0
-    system[:, 2:] = system[:, 2:] / 12.0
-    tensors["system"] = system
+    system = tensors["system"]
+    system[:, 0] /= 12.0
+    system[:, 2:] /= 12.0
     return tensors
-
-
-def transition_row_to_tensors(
-    transition: AgentTransition,
-    device: torch.device,
-    *,
-    next_obs: bool = False,
-) -> dict[str, torch.Tensor]:
-    batch = transition.next_obs if next_obs else transition.obs
-    row = transition.next_agent_index if next_obs else transition.agent_index
-    return batch_rows_to_tensors(batch, [row], device)
 
 
 def _actor_inputs(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

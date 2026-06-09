@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from src.env import CoreType, RewardWeights, SchedulerEnv, WorkloadScenario
-from src.rl import RolloutBuffer, collect_episode
+from src.rl import ReplayBuffer, RolloutBuffer, collect_episode
 from src.train_logging import (
     configure_logging,
     get_logger,
@@ -119,8 +119,50 @@ def main() -> None:
     parser.add_argument("--actor-learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--critic-learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--clip-ratio", type=float, default=0.05)
-    parser.add_argument("--entropy-coef", type=float, default=0.0)
+    parser.add_argument(
+        "--entropy-coef",
+        type=float,
+        default=0.0,
+        help="Initial entropy bonus coefficient (start of the anneal schedule).",
+    )
+    parser.add_argument(
+        "--entropy-coef-final",
+        type=float,
+        default=None,
+        help=(
+            "Final entropy coefficient to anneal toward. None (default) keeps "
+            "--entropy-coef constant. Set lower than --entropy-coef to decay "
+            "exploration as the policy converges (mitigates late policy drift)."
+        ),
+    )
+    parser.add_argument(
+        "--entropy-anneal-episodes",
+        type=int,
+        default=None,
+        help=(
+            "Episodes over which entropy-coef linearly reaches its final value. "
+            "None (default) uses the full --episodes budget."
+        ),
+    )
     parser.add_argument("--update-epochs", type=int, default=2)
+    parser.add_argument(
+        "--num-minibatches",
+        type=int,
+        default=1,
+        help=(
+            "Minibatches per update epoch over the macro-timeline intervals. "
+            "1 (default) is a full-batch update."
+        ),
+    )
+    parser.add_argument(
+        "--replay-capacity",
+        type=int,
+        default=0,
+        help=(
+            "Number of recent rollouts retained and reused each update "
+            "(on-policy replay; PPO clipping bounds the staleness). 0 disables."
+        ),
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -179,6 +221,7 @@ def main() -> None:
         clip_ratio=args.clip_ratio,
         entropy_coef=args.entropy_coef,
         update_epochs=args.update_epochs,
+        num_minibatches=args.num_minibatches,
     )
     policy = TorchACACPolicy(config, device=args.device)
     if args.pretrained_actors is not None:
@@ -205,7 +248,7 @@ def main() -> None:
         start_episode = int(checkpoint["episode"]) + 1
         best_eval_reward = float(checkpoint.get("best_eval_reward", float("-inf")))
         logger.info(
-            "resumed checkpoint=%s next_episode=%d", args.resume, start_episode
+            "resumed checkpoint=%s next_iter=%d", args.resume, start_episode
         )
 
     logger.info("=== ACAC single-config sanity training ===")
@@ -292,6 +335,7 @@ def run_training_loop(
     start_episode: int,
     best_eval_reward: float,
 ) -> None:
+    replay = ReplayBuffer(capacity=getattr(args, "replay_capacity", 0))
     for episode_idx in range(start_episode, args.episodes + 1):
         rollout, metrics = collect_training_rollout(
             policy,
@@ -304,7 +348,12 @@ def run_training_loop(
             logger.warning("iter %d skipped empty rollout", episode_idx)
             continue
 
-        stats = trainer.update(rollout)
+        entropy_coef = entropy_coef_at(args, episode_idx)
+        # Reuse recent rollouts (no-op when --replay-capacity 0); the current
+        # rollout stays untouched so the logged diagnostics describe this episode.
+        train_rollout = replay.combined(rollout)
+        stats = trainer.update(train_rollout, entropy_coef=entropy_coef)
+        replay.add(rollout)
         total_reward = rollout.total_env_reward / args.rollout_episodes
         should_eval = episode_idx == start_episode or episode_idx % args.eval_every == 0
         eval_summary = (
@@ -496,27 +545,28 @@ def collect_training_rollout(
     gamma: float,
     episode_idx: int,
     executor,
-) -> tuple[RolloutBuffer, Any]:
+) -> tuple[RolloutBuffer, dict[str, Any]]:
     """Collect ``rollout_episodes`` episodes and merge them in seed order.
 
     Merging in seed order (not completion order) keeps episode ids and joint
     indices identical to sequential collection, so credit assignment is
     unchanged regardless of which worker finished first. Returns the merged
-    buffer and the metrics of the last-seed episode (matching the sequential
-    ``env.metrics()`` used for logging).
+    buffer and the per-field **mean** of the episode metrics across all rollout
+    episodes, so the logged done/throughput/turnaround describe the whole batch
+    instead of a single (last-seed) episode.
     """
 
     seeds = rollout_seeds(args, episode_idx)
     scenarios = rollout_scenarios(args, episode_idx)
     rollout = RolloutBuffer()
-    last_metrics = None
+    episode_metrics: list[Any] = []
 
     if executor is None:
         for seed, scenario in zip(seeds, scenarios, strict=True):
             env = make_env(args, seed=seed, workload_scenario=scenario)
             rollout.extend(collect_episode(env, policy, seed=seed, gamma=gamma))
-            last_metrics = env.metrics()
-        return rollout, last_metrics
+            episode_metrics.append(env.metrics())
+        return rollout, aggregate_episode_metrics(episode_metrics)
 
     cpu_state = {key: value.detach().cpu() for key, value in policy.state_dict().items()}
     tasks = [
@@ -525,8 +575,55 @@ def collect_training_rollout(
     ]
     for buffer, metrics in executor.map(_run_rollout_worker, tasks):
         rollout.extend(buffer)
-        last_metrics = metrics
-    return rollout, last_metrics
+        episode_metrics.append(metrics)
+    return rollout, aggregate_episode_metrics(episode_metrics)
+
+
+def aggregate_episode_metrics(metrics_list: list[Any]) -> dict[str, Any]:
+    """Mean of each ``EpisodeMetrics`` field across the rollout episodes.
+
+    Task counts become floats (e.g. ``31.4``). ``None`` fields (percentiles for
+    an episode that completed nothing) are dropped from the mean; a field that
+    is ``None`` in every episode stays ``None``. ``per_core_utilization`` is
+    averaged per core. Empty input returns an empty dict.
+    """
+    if not metrics_list:
+        return {}
+    return _mean_nested([metrics.as_dict() for metrics in metrics_list])
+
+
+def _mean_nested(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in rows[0]:
+        values = [row[key] for row in rows]
+        if isinstance(values[0], dict):
+            result[key] = _mean_nested(values)
+        else:
+            present = [value for value in values if value is not None]
+            result[key] = float(np.mean(present)) if present else None
+    return result
+
+
+def entropy_coef_at(args: argparse.Namespace, episode_idx: int) -> float:
+    """Linearly annealed entropy coefficient for ``episode_idx`` (1-based).
+
+    Returns the constant ``--entropy-coef`` when ``--entropy-coef-final`` is
+    unset. Otherwise interpolates from the initial to the final coefficient over
+    ``--entropy-anneal-episodes`` (defaulting to the full ``--episodes`` budget)
+    and holds the final value afterwards.
+    """
+
+    start = float(getattr(args, "entropy_coef", 0.0))
+    final = getattr(args, "entropy_coef_final", None)
+    if final is None:
+        return start
+    final = float(final)
+    anneal_episodes = getattr(args, "entropy_anneal_episodes", None) or getattr(
+        args, "episodes", 1
+    )
+    anneal_episodes = max(1, int(anneal_episodes))
+    progress = min(1.0, max(0.0, (episode_idx - 1) / max(1, anneal_episodes - 1)))
+    return start + (final - start) * progress
 
 
 def reward_weights_from_args(args: argparse.Namespace) -> RewardWeights:
@@ -854,6 +951,8 @@ def build_log_row(
         "invalid_actions": rollout.invalid_actions,
         "preemptions": rollout.preemptions,
         "decisions": rollout.decisions,
+        "noop_decisions": rollout.noop_decisions,
+        "noop_fraction": rollout.noop_fraction,
         "mean_task_choices": rollout.mean_task_choices,
         "max_task_choices": rollout.max_task_choices,
         "forced_decision_fraction": rollout.forced_decision_fraction,
@@ -865,7 +964,7 @@ def build_log_row(
         ),
         "mean_elapsed_time": float(np.mean(elapsed_times)),
         "actions": summarize_rollout_actions(rollout),
-        "metrics": metrics.as_dict(),
+        "metrics": metrics,
         "update": asdict(stats),
         "evaluation": eval_summary,
     }
@@ -901,7 +1000,7 @@ def save_checkpoint(
     temp_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(checkpoint, temp_path)
     temp_path.replace(path)
-    get_logger().info("saved checkpoint=%s episode=%d", path, episode_idx)
+    get_logger().info("saved checkpoint=%s iter=%d", path, episode_idx)
 
 
 def validate_checkpoint_version(checkpoint: dict[str, Any]) -> None:
