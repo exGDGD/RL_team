@@ -271,6 +271,13 @@ python -m src.train_acac \
 3. 구현/테스트 후 필요한 파일만 commit합니다.
 4. `.venv`, generated trace, training output은 commit하지 않습니다.
 
+## TODO
+
+- [ ] entropy를 학습 진행에 따라 줄여가며(annealing) 학습하도록 적용 — 후반 policy drift 완화 (design-doc §학습 안정화)
+- [ ] mini-batch + replay buffer 추가
+- [ ] no-op 선택 횟수 로그 추가
+- [ ] transition 수(count)도 출력
+
 ## notes
 Main experiment v0(현재 버전):
   Global ready queue
