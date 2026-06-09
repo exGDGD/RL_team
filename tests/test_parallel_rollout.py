@@ -8,8 +8,16 @@ a process boundary — is pure-Python/numpy and is validated here.
 import pickle
 from argparse import Namespace
 
+import pytest
+
+from src.env.metrics import EpisodeMetrics
 from src.rl import RolloutBuffer, collect_episode
-from src.train_acac import collect_training_rollout, make_env, rollout_seeds
+from src.train_acac import (
+    aggregate_episode_metrics,
+    collect_training_rollout,
+    make_env,
+    rollout_seeds,
+)
 
 
 class FirstValidPolicy:
@@ -52,11 +60,11 @@ def test_sequential_training_rollout_matches_manual_loop() -> None:
     )
 
     manual = RolloutBuffer()
-    last_metrics = None
+    manual_metrics = []
     for seed in rollout_seeds(args, 1):
         env = make_env(args, seed=seed)
         manual.extend(collect_episode(env, policy, seed=seed, gamma=0.99))
-        last_metrics = env.metrics()
+        manual_metrics.append(env.metrics())
 
     assert rollout.episodes == manual.episodes == args.rollout_episodes
     assert len(rollout) == len(manual)
@@ -67,7 +75,9 @@ def test_sequential_training_rollout_matches_manual_loop() -> None:
         t.joint_index for t in manual.transitions
     ]
     assert rollout.total_env_reward == manual.total_env_reward
-    assert metrics.completed_tasks == last_metrics.completed_tasks
+    # collect_training_rollout now returns the per-field mean across all rollout
+    # episodes, not the last-seed snapshot.
+    assert metrics == aggregate_episode_metrics(manual_metrics)
 
 
 def test_seed_order_merge_is_completion_order_independent() -> None:
@@ -99,6 +109,69 @@ def test_seed_order_merge_is_completion_order_independent() -> None:
     ]
     assert len(forward.joint_transitions) == len(reordered.joint_transitions)
     assert forward.total_env_reward == reordered.total_env_reward
+
+
+def _episode_metrics(
+    *,
+    total: int,
+    completed: int,
+    throughput: float,
+    turnaround: float | None,
+    p99_turnaround: float | None,
+    per_core: dict[str, float],
+) -> EpisodeMetrics:
+    return EpisodeMetrics(
+        total_tasks=total,
+        completed_tasks=completed,
+        makespan=40.0,
+        throughput=throughput,
+        total_energy=100.0,
+        mean_response_time=1.0,
+        p95_response_time=2.0,
+        p99_response_time=3.0,
+        mean_turnaround_time=turnaround,
+        p95_turnaround_time=turnaround,
+        p99_turnaround_time=p99_turnaround,
+        mean_ready_wait_time=1.0,
+        p95_ready_wait_time=2.0,
+        starvation_rate=None,
+        mean_utilization=sum(per_core.values()) / len(per_core),
+        per_core_utilization=per_core,
+    )
+
+
+def test_aggregate_episode_metrics_averages_fields_and_handles_none() -> None:
+    metrics = [
+        _episode_metrics(
+            total=32, completed=30, throughput=0.5, turnaround=10.0,
+            p99_turnaround=None, per_core={"p_0": 0.8, "e_0": 0.6},
+        ),
+        _episode_metrics(
+            total=32, completed=32, throughput=0.7, turnaround=20.0,
+            p99_turnaround=5.0, per_core={"p_0": 0.6, "e_0": 0.4},
+        ),
+    ]
+
+    agg = aggregate_episode_metrics(metrics)
+
+    # Counts become floats; plain numeric fields are averaged.
+    assert agg["completed_tasks"] == pytest.approx(31.0)
+    assert agg["total_tasks"] == pytest.approx(32.0)
+    assert agg["throughput"] == pytest.approx(0.6)
+    assert agg["mean_turnaround_time"] == pytest.approx(15.0)
+    # None entries are dropped from the mean rather than poisoning it.
+    assert agg["p99_turnaround_time"] == pytest.approx(5.0)
+    # A field that is None in every episode stays None.
+    assert agg["starvation_rate"] is None
+    # Nested per-core utilization is averaged per core.
+    assert agg["per_core_utilization"] == {
+        "p_0": pytest.approx(0.7),
+        "e_0": pytest.approx(0.5),
+    }
+
+
+def test_aggregate_episode_metrics_empty_returns_empty_dict() -> None:
+    assert aggregate_episode_metrics([]) == {}
 
 
 def test_rollout_buffer_and_metrics_survive_pickle() -> None:

@@ -69,10 +69,10 @@ def log_episode_train(
     preempt_per_episode = rollout.preemptions / max(rollout.episodes, 1)
     entropy_coef = getattr(stats, "entropy_coef", 0.0)
     get_logger().info(
-        "iter %4d | reward %+8.3f | loss %7.3f (pi %+.4f  v %.3f  ent %.3f) "
+        "iter %4d | reward %+8.3f | loss %7.3f (pi %+.4f  v %.3f  ent %.3f ec %.4f) "
         "| kl %.4f clip %.3f | grad a/c %.2f/%.2f "
         "| trans %d/%d noop %d (%.2f) conflict %d preempt %.1f choices %.2f forced %.2f "
-        "| done %d/%d thru %.3f turn %s",
+        "| done %.1f/%.1f thru %.3f turn %s",
         episode_idx,
         total_reward,
         stats.loss,
@@ -92,10 +92,10 @@ def log_episode_train(
         preempt_per_episode,
         rollout.mean_task_choices,
         rollout.forced_decision_fraction,
-        metrics.completed_tasks,
-        metrics.total_tasks,
-        metrics.throughput,
-        _fmt(metrics.mean_turnaround_time),
+        metrics["completed_tasks"],
+        metrics["total_tasks"],
+        metrics["throughput"],
+        _fmt(metrics["mean_turnaround_time"]),
     )
 
 
