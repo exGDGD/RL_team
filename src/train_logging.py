@@ -67,10 +67,11 @@ def log_episode_train(
     """One compact progress line emitted every training update iteration."""
 
     preempt_per_episode = rollout.preemptions / max(rollout.episodes, 1)
+    entropy_coef = getattr(stats, "entropy_coef", 0.0)
     get_logger().info(
         "iter %4d | reward %+8.3f | loss %7.3f (pi %+.4f  v %.3f  ent %.3f) "
         "| kl %.4f clip %.3f | grad a/c %.2f/%.2f "
-        "| conflict %d preempt %.1f choices %.2f forced %.2f "
+        "| trans %d/%d noop %d (%.2f) conflict %d preempt %.1f choices %.2f forced %.2f "
         "| done %d/%d thru %.3f turn %s",
         episode_idx,
         total_reward,
@@ -78,10 +79,15 @@ def log_episode_train(
         stats.policy_loss,
         stats.value_loss,
         stats.entropy,
+        entropy_coef,
         stats.approx_kl,
         stats.clip_fraction,
         stats.actor_grad_norm,
         stats.critic_grad_norm,
+        len(rollout.transitions),
+        len(rollout.joint_transitions),
+        rollout.noop_decisions,
+        rollout.noop_fraction,
         rollout.conflicts,
         preempt_per_episode,
         rollout.mean_task_choices,

@@ -7,7 +7,7 @@ from pathlib import Path
 torch = pytest.importorskip("torch")
 
 from src.env import CoreType, SchedulerEnv, WorkloadScenario
-from src.rl import AgentBatch, collect_episode
+from src.rl import AgentBatch, ReplayBuffer, collect_episode
 from src.rl.trainer import (
     ACACConfig,
     ACACTrainer,
@@ -77,6 +77,69 @@ def test_torch_acac_policy_can_update_from_collected_rollout() -> None:
         np.count_nonzero(transition.action_mask) > 1
         for transition in rollout.transitions
     )
+
+
+def _balanced_rollout(seed: int = 3):
+    env = SchedulerEnv(
+        core_config={CoreType.P: 1},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=2.0,
+        episode_time=30.0,
+        max_tasks=16,
+        seed=seed,
+    )
+    return collect_episode(env, FirstValidPolicy(), seed=seed)
+
+
+def _learnable_actor_samples(rollout) -> int:
+    return sum(
+        np.count_nonzero(transition.action_mask) > 1
+        for transition in rollout.transitions
+    )
+
+
+def test_minibatched_update_covers_all_actor_samples() -> None:
+    rollout = _balanced_rollout()
+    policy = TorchACACPolicy(
+        ACACConfig(hidden_dim=16, critic_heads=4, num_minibatches=4)
+    )
+    trainer = ACACTrainer(policy)
+
+    stats = trainer.update(rollout)
+
+    assert np.isfinite(stats.loss)
+    assert np.isfinite(stats.policy_loss)
+    assert np.isfinite(stats.value_loss)
+    # Splitting into minibatches must still credit every learnable transition.
+    assert stats.actor_samples == _learnable_actor_samples(rollout)
+
+
+def test_update_reports_supplied_entropy_coefficient() -> None:
+    rollout = _balanced_rollout()
+    policy = TorchACACPolicy(ACACConfig(hidden_dim=16, critic_heads=4))
+    trainer = ACACTrainer(policy)
+
+    stats = trainer.update(rollout, entropy_coef=0.05)
+
+    assert stats.entropy_coef == pytest.approx(0.05)
+
+
+def test_update_on_replayed_rollout_trains_on_merged_samples() -> None:
+    current = _balanced_rollout(seed=3)
+    replay = ReplayBuffer(capacity=1)
+    replay.add(_balanced_rollout(seed=4))
+    merged = replay.combined(current)
+
+    policy = TorchACACPolicy(
+        ACACConfig(hidden_dim=16, critic_heads=4, num_minibatches=2)
+    )
+    trainer = ACACTrainer(policy)
+
+    stats = trainer.update(merged)
+
+    assert np.isfinite(stats.loss)
+    assert stats.actor_samples == _learnable_actor_samples(merged)
+    assert stats.actor_samples > _learnable_actor_samples(current)
 
 
 def test_compute_advantages_does_not_cross_episode_boundaries() -> None:

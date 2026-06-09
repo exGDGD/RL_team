@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from src.env import CoreType, RewardWeights, SchedulerEnv, WorkloadScenario
-from src.rl import RolloutBuffer, collect_episode
+from src.rl import ReplayBuffer, RolloutBuffer, collect_episode
 from src.train_logging import (
     configure_logging,
     get_logger,
@@ -119,8 +119,50 @@ def main() -> None:
     parser.add_argument("--actor-learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--critic-learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--clip-ratio", type=float, default=0.05)
-    parser.add_argument("--entropy-coef", type=float, default=0.0)
+    parser.add_argument(
+        "--entropy-coef",
+        type=float,
+        default=0.0,
+        help="Initial entropy bonus coefficient (start of the anneal schedule).",
+    )
+    parser.add_argument(
+        "--entropy-coef-final",
+        type=float,
+        default=None,
+        help=(
+            "Final entropy coefficient to anneal toward. None (default) keeps "
+            "--entropy-coef constant. Set lower than --entropy-coef to decay "
+            "exploration as the policy converges (mitigates late policy drift)."
+        ),
+    )
+    parser.add_argument(
+        "--entropy-anneal-episodes",
+        type=int,
+        default=None,
+        help=(
+            "Episodes over which entropy-coef linearly reaches its final value. "
+            "None (default) uses the full --episodes budget."
+        ),
+    )
     parser.add_argument("--update-epochs", type=int, default=2)
+    parser.add_argument(
+        "--num-minibatches",
+        type=int,
+        default=1,
+        help=(
+            "Minibatches per update epoch over the macro-timeline intervals. "
+            "1 (default) is a full-batch update."
+        ),
+    )
+    parser.add_argument(
+        "--replay-capacity",
+        type=int,
+        default=0,
+        help=(
+            "Number of recent rollouts retained and reused each update "
+            "(on-policy replay; PPO clipping bounds the staleness). 0 disables."
+        ),
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -179,6 +221,7 @@ def main() -> None:
         clip_ratio=args.clip_ratio,
         entropy_coef=args.entropy_coef,
         update_epochs=args.update_epochs,
+        num_minibatches=args.num_minibatches,
     )
     policy = TorchACACPolicy(config, device=args.device)
     if args.pretrained_actors is not None:
@@ -292,6 +335,7 @@ def run_training_loop(
     start_episode: int,
     best_eval_reward: float,
 ) -> None:
+    replay = ReplayBuffer(capacity=getattr(args, "replay_capacity", 0))
     for episode_idx in range(start_episode, args.episodes + 1):
         rollout, metrics = collect_training_rollout(
             policy,
@@ -304,7 +348,12 @@ def run_training_loop(
             logger.warning("iter %d skipped empty rollout", episode_idx)
             continue
 
-        stats = trainer.update(rollout)
+        entropy_coef = entropy_coef_at(args, episode_idx)
+        # Reuse recent rollouts (no-op when --replay-capacity 0); the current
+        # rollout stays untouched so the logged diagnostics describe this episode.
+        train_rollout = replay.combined(rollout)
+        stats = trainer.update(train_rollout, entropy_coef=entropy_coef)
+        replay.add(rollout)
         total_reward = rollout.total_env_reward / args.rollout_episodes
         should_eval = episode_idx == start_episode or episode_idx % args.eval_every == 0
         eval_summary = (
@@ -527,6 +576,28 @@ def collect_training_rollout(
         rollout.extend(buffer)
         last_metrics = metrics
     return rollout, last_metrics
+
+
+def entropy_coef_at(args: argparse.Namespace, episode_idx: int) -> float:
+    """Linearly annealed entropy coefficient for ``episode_idx`` (1-based).
+
+    Returns the constant ``--entropy-coef`` when ``--entropy-coef-final`` is
+    unset. Otherwise interpolates from the initial to the final coefficient over
+    ``--entropy-anneal-episodes`` (defaulting to the full ``--episodes`` budget)
+    and holds the final value afterwards.
+    """
+
+    start = float(getattr(args, "entropy_coef", 0.0))
+    final = getattr(args, "entropy_coef_final", None)
+    if final is None:
+        return start
+    final = float(final)
+    anneal_episodes = getattr(args, "entropy_anneal_episodes", None) or getattr(
+        args, "episodes", 1
+    )
+    anneal_episodes = max(1, int(anneal_episodes))
+    progress = min(1.0, max(0.0, (episode_idx - 1) / max(1, anneal_episodes - 1)))
+    return start + (final - start) * progress
 
 
 def reward_weights_from_args(args: argparse.Namespace) -> RewardWeights:
@@ -854,6 +925,8 @@ def build_log_row(
         "invalid_actions": rollout.invalid_actions,
         "preemptions": rollout.preemptions,
         "decisions": rollout.decisions,
+        "noop_decisions": rollout.noop_decisions,
+        "noop_fraction": rollout.noop_fraction,
         "mean_task_choices": rollout.mean_task_choices,
         "max_task_choices": rollout.max_task_choices,
         "forced_decision_fraction": rollout.forced_decision_fraction,
