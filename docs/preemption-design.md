@@ -6,7 +6,7 @@
 > - ✅ env 기반: 부분 burst, preempt 기계, P1/P3+min_run 게이트, CS 비용, self 8-dim, force_progress (`enable_preemption` 플래그)
 > - ✅ RL 활성화: `obs.decision_mask=has_task_action`, rollout preempt transition(닫고-열기 + 동일 step 완료 처리) + idle NO-OP 기록(item 2), `allow_noop=True`, `train_acac --disable-preemption`(기본 on)
 > - ✅ item 1: ready_queue 6→4 (`current_cpu_burst`/`remaining_cpu_work` 제거 — SJF 정답지 비노출). spaces/env/normalize/summarize + 테스트 갱신, burst-노출 테스트 삭제.
-> - ✅ 검증: runnable 테스트 42 passed (preemption 발생·credit 일관성·NO-OP 기록 포함). torch 네트워크 테스트 2개는 미설치로 skip — `rl-team`에서 확인 필요.
+> - ✅ 검증: `rl-team`에서 `conda run -n rl-team python -m pytest -q -rs` 기준 49 passed, 2 skipped. skip은 torch 미설치로 인한 actor/critic forward 및 trainer update 테스트이며, Colab/torch 환경에서 추가 확인 필요.
 > **선행 논의:** teamplo 6/3 패치 — item 1(obs에서 burst 제거)·item 2(NO-OP 활성)·item 3(preemption+CS 비용)
 > **결정된 순서:** preemption(+NO-OP)을 **먼저** 구현 → 그다음 obs burst 제거(item 1).
 > 이유: burst를 먼저 빼면 "obs 불확실 + 복구 불가"가 겹쳐 중간 단계 에이전트가 최악이 됨. preemption이 "돌려보고 고치는" 복구 메커니즘을 먼저 제공해야 함.
@@ -151,7 +151,7 @@ switch 시 코어 타입별 CS 비용(core spec: Prime 1.5 / P 1.0 / E 0.3 / LP-
 
 ## 8. 검증 한계
 
-임시 venv(numpy/simpy/gymnasium/pytest, torch 제외)로 **runnable 테스트 42 passed** 직접 확인(preemption 발생·credit 일관성·NO-OP 기록·obs 4-dim 포함). `torch` 미설치라 네트워크 forward 2개(`test_rl_networks`)와 policy.act `allow_noop` 마스킹·self/ready_queue 정규화 torch 경로는 미검증 — `rl-team`(또는 Colab 노트북 8장)에서 `pytest -q` 필요.
+현재 `rl-team` conda 환경에서 **49 passed, 2 skipped**까지 확인했다. 통과 범위에는 preemption 발생, credit 일관성, idle NO-OP 기록, obs 4-dim 계약, rollout/buffer helper가 포함된다. skip 2개는 torch 미설치로 인한 `test_rl_networks.py`, `test_rl_trainer.py`이며, actor/critic forward와 trainer update는 Colab 또는 torch 설치 환경에서 추가 확인해야 한다.
 
 ---
 

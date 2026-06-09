@@ -148,8 +148,15 @@ tests/                    # test_baselines, test_metrics, test_scheduler_env, te
 
 - `RandomPolicy`: valid ready-queue slot 중 무작위 선택
 - `RoundRobinPolicy`: ready-queue slot을 순환 선택
-- `SJFLikePolicy`: 현재 CPU burst runtime이 가장 짧은 task 선택
+- `MLFQPolicy`: task별 CPU service history와 aging을 쓰는 multi-level feedback queue 휴리스틱
+- `SJFLikePolicy`: ready queue 안에서 해당 core에 올렸을 때의 **현재 CPU burst 실행시간**이 가장 짧은 task 선택
 - `EASLikePolicy`: latency criticality, CPU intensity, core type affinity를 이용한 휴리스틱
+
+`MLFQPolicy`는 RL actor와 observation을 맞춘 fair baseline이 아니라, task `pid`와 누적 CPU service history를 쓰는 OS-style reference baseline입니다. 현재 simulator에는 timer tick decision point가 없으므로 quantum 만료 즉시 preempt하는 전통적 MLFQ와 1:1은 아니고, env가 scheduling decision을 열 때마다 누적 service 기준 demotion과 waiting-time aging promotion을 적용합니다.
+
+`SJFLikePolicy`는 env 내부의 `current_cpu_burst`와 core별 runtime 계산(`_runtime_on_core`)을 직접 사용합니다. 즉 actor observation에는 숨긴 burst 길이를 보는 oracle-like baseline이며, 전통적인 single-machine SJF와도 다릅니다. 이 repo에서의 SJF-like는 "현재 ready queue에서 지금 배정 가능한 burst 중, 이 코어에서 가장 빨리 끝날 것을 고르는 non-preemptive greedy heuristic"으로 해석해야 합니다.
+
+또한 학습 기본값은 preemption을 켜지만(`train_acac.py`의 `enable_preemption=True`), 현재 baseline policy들은 idle core만 배정합니다. preemption-aware baseline은 아직 없으므로, baseline 비교는 sanity/reference 용도로 쓰고 최종 공정 비교에서는 preemption 조건을 맞추거나 별도 baseline을 추가해야 합니다.
 
 간단한 multi-seed baseline 비교는 다음 명령으로 실행합니다. 출력값은 평균 `+/-` 표준편차 형식입니다.
 
@@ -169,7 +176,7 @@ Single-config sanity training은 Colab에서 다음처럼 실행합니다.
 python -m src.train_acac --episodes 100 --eval-every 10
 ```
 
-현재 학습 entrypoint는 `P2E2 + balanced workload` 고정 구성으로 시작합니다. 기본 arrival rate는 `1.0`, 최대 task 수는 `64`입니다. 너무 한산한 workload에서는 대부분의 decision에 선택 가능한 task가 하나뿐이라 정책을 학습할 수 없습니다. 출력의 `choices`와 `forced`를 함께 확인합니다. `SchedulerEnv`의 NO-OP는 아직 idle duration을 진행시키지 않으므로, 초기 ACAC sanity training에서는 NO-OP sampling을 비활성화합니다.
+현재 학습 entrypoint는 core 구성은 `P2E2`로 고정하고, workload는 기본적으로 `--train-scenarios all`로 네 scenario를 섞어 시작합니다. 기본 arrival rate는 `1.0`, 최대 task 수는 `64`입니다. 너무 한산한 workload에서는 대부분의 decision에 선택 가능한 task가 하나뿐이라 정책을 학습할 수 없습니다. 출력의 `choices`와 `forced`를 함께 확인합니다. idle NO-OP은 이제 `force_progress`로 다음 이벤트까지 시간을 진행시키며, `latency_flow` reward에서는 대기 중 task가 계속 flow-time penalty를 만들기 때문에 "아무것도 안 하기"가 공짜 전략이 아닙니다.
 
 학습 update 한 번에는 기본적으로 16개 episode rollout을 합칩니다. ACAC critic은 누군가 새 scheduling decision을 만드는 시점을 shared joint macro-timestep으로 사용합니다. 각 joint interval 내부의 system-wide team reward는 simulated elapsed time에 따라 할인하고 agent 수로 평균냅니다. Joint timeline에서 GAE를 한 번 계산한 뒤, 각 actor action은 자신이 시작된 joint macro-timestep의 advantage를 사용합니다. 선택 가능한 task가 하나뿐인 forced transition은 critic timeline에는 남기되 actor update에서는 제외합니다. 콘솔과 평가의 reward는 학습용 평균 reward가 아니라 환경이 실제로 방출한 episode 총점입니다. critic target은 raw 평가 reward와 분리하여 `reward_scale=0.01`을 적용하고, actor와 critic gradient clipping도 별도로 수행합니다. 입력 observation의 대기시간, 진행시간, 누적 에너지는 MLP에 넣기 전에 `log1p`로 안정화합니다.
 
@@ -216,9 +223,40 @@ python -m src.train_acac \
   --starvation-max-wait-weight 0.5
 ```
 
+latency 중심 목적에서는 `latency_flow` reward를 권장합니다. 이 모드는 도착했지만 끝나지 않은 task 수를 latency class별 가중치로 세고, elapsed simulated time을 곱해 매 step penalty를 줍니다. task가 첫 실행을 기다리는 동안에는 `--response-weight`가 추가로 곱해져 response time도 압박합니다.
+
+```bash
+python -m src.train_acac \
+  --reward-mode latency_flow \
+  --lambda-energy 0.1 \
+  --lambda-flow 1.0 \
+  --response-weight 1.5
+```
+
+현재 설정에서 학습이 움직이는 주된 이유는 네 가지입니다. 첫째, `arrival_rate=1.0`과 `max_tasks=64`가 ready queue 선택지를 충분히 만들어 forced decision 비율을 낮춥니다. 둘째, progress/completion 같은 거의 상수인 shaping을 끄고 energy/starvation/latency 또는 flow-time cost를 남겨 action 간 reward 차이를 키웁니다. 셋째, joint macro-timeline GAE와 `reward_scale=0.01`이 비동기 simulated time reward를 critic target으로 안정적으로 넘깁니다. 넷째, action mask와 forced transition filtering으로 actor가 실제 선택 여지가 있는 transition 위주로 업데이트됩니다.
+
+학습 rollout은 기본적으로 `--train-scenarios all`을 사용해 네 workload scenario를 round-robin으로 섞습니다. 특정 분포만 보고 싶으면 `balanced` 또는 comma-separated list를 넘깁니다. 학습 중 validation eval도 기본적으로 `--eval-scenarios all`을 사용하고, 학습 종료 후에는 별도 seed range의 `--test-scenarios all` held-out test를 best checkpoint에 대해 한 번 실행합니다.
+
+```bash
+python -m src.train_acac \
+  --train-scenarios all \
+  --eval-scenarios all \
+  --test-scenarios all \
+  --rollout-episodes 16
+```
+
+기존 single-scenario sanity run을 재현하려면 다음처럼 명시합니다.
+
+```bash
+python -m src.train_acac --train-scenarios balanced
+```
+
+각 update에서 사용한 scenario mix는 `metrics.jsonl`의 `train_scenarios` 필드에 기록됩니다.
+Validation/test에 사용한 scenario mix는 evaluation summary의 `scenario_counts`에 기록됩니다. 기본 seed split은 train=`--seed`, validation=`--eval-seed 10000`, test=`--test-seed 20000`으로 분리되어 있습니다.
+
 학습 중 `outputs/acac_p2e2/`에 `metrics.jsonl`, `train.log`, `latest.pt`, `best.pt`가 생성됩니다. Colab 런타임 종료 후에도 보존하려면 `--output-dir`에 Google Drive 경로를 넘깁니다. 중단된 학습은 다음처럼 이어서 실행합니다.
 
-로그는 두 갈래로 나뉩니다. `metrics.jsonl`은 episode별 전체 지표를 담는 기계 판독용 구조화 기록이고, 콘솔과 `train.log`(`src/train_logging.py`)는 사람이 한눈에 훑기 위한 요약입니다. 매 episode `ep ... | reward ... | loss ...` 한 줄이 찍히고, 평가 episode에서는 그 아래로 `eval`(deterministic / sampled reward)과 `base`(random/sjf/eas baseline) 블록이 들여쓰여 추가됩니다. eval 줄의 `reward`는 argmax action을 쓰는 deterministic 평가, 괄호 안 `sampled`는 현재 확률 정책에서 action을 sampling한 평가입니다. 학습 초반에는 entropy가 높으므로 random baseline과 비교할 때 `sampled`도 함께 확인합니다.
+로그는 두 갈래로 나뉩니다. `metrics.jsonl`은 iteration별 전체 지표를 담는 기계 판독용 구조화 기록이고, 콘솔과 `train.log`(`src/train_logging.py`)는 사람이 한눈에 훑기 위한 요약입니다. 매 update iteration마다 `iter ... | reward ... | loss ...` 한 줄이 찍히고, 평가 iteration에서는 그 아래로 `eval`(deterministic / sampled reward), `base`(random/mlfq/sjf/eas baseline), 그리고 scenario별 `eval/<scenario>` 블록이 들여쓰여 추가됩니다. eval 줄의 `reward`는 argmax action을 쓰는 deterministic 평가, 괄호 안 `sampled`는 현재 확률 정책에서 action을 sampling한 평가입니다. 학습 초반에는 entropy가 높으므로 random baseline과 비교할 때 `sampled`도 함께 확인합니다.
 
 ```bash
 python -m src.train_acac \

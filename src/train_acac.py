@@ -28,6 +28,26 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--eval-seed", type=int, default=10_000)
+    parser.add_argument(
+        "--eval-scenarios",
+        type=str,
+        default="all",
+        help=(
+            "Comma-separated workload scenarios for fixed validation eval, "
+            "or 'all'. Uses held-out eval seeds."
+        ),
+    )
+    parser.add_argument("--test-episodes", type=int, default=20)
+    parser.add_argument("--test-seed", type=int, default=20_000)
+    parser.add_argument(
+        "--test-scenarios",
+        type=str,
+        default="all",
+        help=(
+            "Comma-separated workload scenarios for final held-out test eval, "
+            "or 'all'. Uses seeds separate from train/eval."
+        ),
+    )
     parser.add_argument("--rollout-episodes", type=int, default=16)
     parser.add_argument(
         "--rollout-workers",
@@ -43,6 +63,16 @@ def main() -> None:
     parser.add_argument("--arrival-rate", type=float, default=1.0)
     parser.add_argument("--episode-time", type=float, default=80.0)
     parser.add_argument("--max-tasks", type=int, default=64)
+    parser.add_argument(
+        "--train-scenarios",
+        type=str,
+        default="all",
+        help=(
+            "Comma-separated workload scenarios sampled round-robin during "
+            "training rollout, or 'all'. Choices: balanced, ui_heavy, "
+            "bg_heavy, burst_stress."
+        ),
+    )
     parser.add_argument(
         "--disable-preemption",
         action="store_true",
@@ -155,6 +185,9 @@ def main() -> None:
     )
     args = parser.parse_args()
     args.enable_preemption = not args.disable_preemption
+    args.train_scenarios = parse_workload_scenarios(args.train_scenarios)
+    args.eval_scenarios = parse_workload_scenarios(args.eval_scenarios)
+    args.test_scenarios = parse_workload_scenarios(args.test_scenarios)
 
     logger = configure_logging(args.output_dir)
 
@@ -256,6 +289,32 @@ def main() -> None:
             start_episode=start_episode,
             best_eval_reward=best_eval_reward,
         )
+        if args.test_episodes > 0:
+            if best_path.exists():
+                checkpoint = torch.load(
+                    best_path,
+                    map_location=policy.device,
+                    weights_only=False,
+                )
+                policy.load_state_dict(checkpoint["model_state_dict"])
+                logger.info("loaded best checkpoint for held-out test=%s", best_path)
+            test_summary = evaluate_policy(
+                policy,
+                args,
+                base_seed=args.test_seed,
+                episodes=args.test_episodes,
+                scenarios=args.test_scenarios,
+            )
+            append_jsonl(
+                metrics_path,
+                {
+                    "episode": args.episodes,
+                    "split": "test",
+                    "test": test_summary,
+                },
+            )
+            logger.info("=== held-out test ===")
+            log_episode_eval(test_summary)
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
@@ -303,6 +362,7 @@ def run_training_loop(
                 args,
                 base_seed=args.eval_seed,
                 episodes=args.eval_episodes,
+                scenarios=args.eval_scenarios,
             )
             if should_eval
             else None
@@ -314,6 +374,7 @@ def run_training_loop(
             metrics=metrics,
             stats=stats,
             eval_summary=eval_summary,
+            train_scenarios=training_scenario_counts(args, episode_idx),
         )
         append_jsonl(metrics_path, log_row)
 
@@ -360,11 +421,11 @@ def rollout_env_kwargs(args: argparse.Namespace) -> dict[str, Any]:
 
     Shared by the in-process ``make_env`` and the rollout workers so a worker's
     environment is byte-for-byte identical to the sequential one for a given
-    seed.
+    seed. The workload scenario is supplied per rollout episode so training can
+    round-robin across scenarios while evaluation can stay fixed.
     """
     return {
         "core_config": {CoreType.P: 2, CoreType.E: 2},
-        "workload_scenario": WorkloadScenario.BALANCED,
         "arrival_rate": args.arrival_rate,
         "episode_time": args.episode_time,
         "max_tasks": args.max_tasks,
@@ -374,9 +435,15 @@ def rollout_env_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def make_env(args: argparse.Namespace, *, seed: int) -> SchedulerEnv:
+def make_env(
+    args: argparse.Namespace,
+    *,
+    seed: int,
+    workload_scenario: WorkloadScenario | str = WorkloadScenario.BALANCED,
+) -> SchedulerEnv:
     return SchedulerEnv(
         seed=seed,
+        workload_scenario=WorkloadScenario(workload_scenario),
         **rollout_env_kwargs(args),
     )
 
@@ -403,16 +470,22 @@ def _init_rollout_worker(config: Any, env_kwargs: dict[str, Any]) -> None:
     _ROLLOUT_WORKER["env_kwargs"] = env_kwargs
 
 
-def _run_rollout_worker(task: tuple[dict[str, Any], int, float]) -> tuple[RolloutBuffer, Any]:
+def _run_rollout_worker(
+    task: tuple[dict[str, Any], int, float, WorkloadScenario]
+) -> tuple[RolloutBuffer, Any]:
     import torch
 
-    state_dict, seed, gamma = task
+    state_dict, seed, gamma, scenario = task
     policy = _ROLLOUT_WORKER["policy"]
     policy.load_state_dict(state_dict)
     policy.eval()
     with torch.no_grad():
         torch.manual_seed(seed)
-        env = SchedulerEnv(seed=seed, **_ROLLOUT_WORKER["env_kwargs"])
+        env = SchedulerEnv(
+            seed=seed,
+            workload_scenario=scenario,
+            **_ROLLOUT_WORKER["env_kwargs"],
+        )
         buffer = collect_episode(env, policy, seed=seed, gamma=gamma)
     return buffer, env.metrics()
 
@@ -422,6 +495,47 @@ def rollout_seeds(args: argparse.Namespace, episode_idx: int) -> list[int]:
         args.seed + (episode_idx - 1) * args.rollout_episodes + offset + 1
         for offset in range(args.rollout_episodes)
     ]
+
+
+def training_scenarios(args: argparse.Namespace) -> tuple[WorkloadScenario, ...]:
+    return parse_workload_scenarios(getattr(args, "train_scenarios", (WorkloadScenario.BALANCED,)))
+
+
+def parse_workload_scenarios(
+    value: str | WorkloadScenario | list[str | WorkloadScenario] | tuple[str | WorkloadScenario, ...],
+) -> tuple[WorkloadScenario, ...]:
+    if isinstance(value, WorkloadScenario):
+        return (value,)
+    if isinstance(value, str):
+        raw_items = [item.strip() for item in value.split(",") if item.strip()]
+        if len(raw_items) == 1 and raw_items[0].lower() == "all":
+            return tuple(WorkloadScenario)
+    else:
+        raw_items = list(value)
+
+    scenarios = tuple(WorkloadScenario(item) for item in raw_items)
+    if not scenarios:
+        raise ValueError("At least one training scenario must be provided.")
+    return scenarios
+
+
+def rollout_scenarios(args: argparse.Namespace, episode_idx: int) -> list[WorkloadScenario]:
+    scenarios = training_scenarios(args)
+    start = (episode_idx - 1) * args.rollout_episodes
+    return [
+        scenarios[(start + offset) % len(scenarios)]
+        for offset in range(args.rollout_episodes)
+    ]
+
+
+def training_scenario_counts(
+    args: argparse.Namespace,
+    episode_idx: int,
+) -> dict[str, int]:
+    counts = {scenario.value: 0 for scenario in training_scenarios(args)}
+    for scenario in rollout_scenarios(args, episode_idx):
+        counts[scenario.value] += 1
+    return counts
 
 
 def collect_training_rollout(
@@ -443,18 +557,22 @@ def collect_training_rollout(
     """
 
     seeds = rollout_seeds(args, episode_idx)
+    scenarios = rollout_scenarios(args, episode_idx)
     rollout = RolloutBuffer()
     episode_metrics: list[Any] = []
 
     if executor is None:
-        for seed in seeds:
-            env = make_env(args, seed=seed)
+        for seed, scenario in zip(seeds, scenarios, strict=True):
+            env = make_env(args, seed=seed, workload_scenario=scenario)
             rollout.extend(collect_episode(env, policy, seed=seed, gamma=gamma))
             episode_metrics.append(env.metrics())
         return rollout, aggregate_episode_metrics(episode_metrics)
 
     cpu_state = {key: value.detach().cpu() for key, value in policy.state_dict().items()}
-    tasks = [(cpu_state, seed, gamma) for seed in seeds]
+    tasks = [
+        (cpu_state, seed, gamma, scenario)
+        for seed, scenario in zip(seeds, scenarios, strict=True)
+    ]
     for buffer, metrics in executor.map(_run_rollout_worker, tasks):
         rollout.extend(buffer)
         episode_metrics.append(metrics)
@@ -529,13 +647,16 @@ def evaluate_policy(
     *,
     base_seed: int,
     episodes: int = 5,
+    scenarios: tuple[WorkloadScenario, ...] | None = None,
 ) -> dict[str, Any]:
+    scenarios = scenarios or (WorkloadScenario.BALANCED,)
     summary = evaluate_rl_policy(
         policy,
         args,
         base_seed=base_seed,
         episodes=episodes,
         deterministic=True,
+        scenarios=scenarios,
     )
     summary["sampled"] = evaluate_rl_policy(
         policy,
@@ -543,9 +664,10 @@ def evaluate_policy(
         base_seed=base_seed,
         episodes=episodes,
         deterministic=False,
+        scenarios=scenarios,
     )
     summary["baselines"] = cached_evaluate_baselines(
-        args, base_seed=base_seed, episodes=episodes
+        args, base_seed=base_seed, episodes=episodes, scenarios=scenarios
     )
     return summary
 
@@ -562,10 +684,12 @@ def cached_evaluate_baselines(
     *,
     base_seed: int,
     episodes: int,
+    scenarios: tuple[WorkloadScenario, ...],
 ) -> dict[str, dict[str, float]]:
     key = (
         base_seed,
         episodes,
+        tuple(scenario.value for scenario in scenarios),
         getattr(args, "arrival_rate", 1.0),
         getattr(args, "episode_time", 80.0),
         getattr(args, "max_tasks", 64),
@@ -584,7 +708,12 @@ def cached_evaluate_baselines(
     )
     cached = _BASELINE_CACHE.get(key)
     if cached is None:
-        cached = evaluate_baselines(args, base_seed=base_seed, episodes=episodes)
+        cached = evaluate_baselines(
+            args,
+            base_seed=base_seed,
+            episodes=episodes,
+            scenarios=scenarios,
+        )
         _BASELINE_CACHE[key] = cached
     return cached
 
@@ -596,6 +725,7 @@ def evaluate_rl_policy(
     base_seed: int,
     episodes: int,
     deterministic: bool,
+    scenarios: tuple[WorkloadScenario, ...],
 ) -> dict[str, Any]:
     rewards = []
     completed = []
@@ -603,9 +733,17 @@ def evaluate_rl_policy(
     diagnostics = []
     action_summaries = []
     preemptions = []
+    scenario_labels = []
+    per_scenario_rows = []
     with preserve_torch_rng(seed=base_seed, enabled=not deterministic):
         for offset in range(episodes):
-            env = make_env(args, seed=base_seed + offset)
+            scenario = scenarios[offset % len(scenarios)]
+            scenario_labels.append(scenario.value)
+            env = make_env(
+                args,
+                seed=base_seed + offset,
+                workload_scenario=scenario,
+            )
             rollout = collect_episode(
                 env,
                 EvaluationPolicy(policy, deterministic=deterministic),
@@ -619,12 +757,24 @@ def evaluate_rl_policy(
             diagnostics.append(env.reward_diagnostics())
             action_summaries.append(summarize_rollout_actions(rollout))
             preemptions.append(rollout.preemptions)
+            per_scenario_rows.append(
+                {
+                    "scenario": scenario.value,
+                    "reward": rollout.total_env_reward,
+                    "completed": metrics.completed_tasks,
+                    "throughput": metrics.throughput,
+                    "preemptions": rollout.preemptions,
+                    "turnaround": metrics.mean_turnaround_time,
+                }
+            )
 
     return {
         "reward": float(np.mean(rewards)),
         "completed": float(np.mean(completed)),
         "throughput": float(np.mean(throughputs)),
         "preemptions": float(np.mean(preemptions)),
+        "scenario_counts": count_labels(scenario_labels),
+        "by_scenario": summarize_eval_rows(per_scenario_rows),
         "reward_diagnostics": mean_dict(diagnostics),
         "actions": mean_dict(action_summaries),
     }
@@ -635,20 +785,36 @@ def evaluate_baselines(
     *,
     base_seed: int,
     episodes: int,
+    scenarios: tuple[WorkloadScenario, ...],
 ) -> dict[str, dict[str, float]]:
-    from src.baselines import EASLikePolicy, RandomPolicy, SJFLikePolicy, run_episode
+    from src.baselines import EASLikePolicy, MLFQPolicy, RandomPolicy, SJFLikePolicy, run_episode
 
-    policies = [RandomPolicy(seed=base_seed), SJFLikePolicy(), EASLikePolicy()]
+    policies = [RandomPolicy(seed=base_seed), MLFQPolicy(), SJFLikePolicy(), EASLikePolicy()]
     summaries = {}
     for baseline in policies:
-        results = [
-            run_episode(
-                make_env(args, seed=base_seed + offset),
+        rows = []
+        results = []
+        for offset in range(episodes):
+            scenario = scenarios[offset % len(scenarios)]
+            result = run_episode(
+                make_env(
+                    args,
+                    seed=base_seed + offset,
+                    workload_scenario=scenario,
+                ),
                 baseline,
                 seed=base_seed + offset,
             )
-            for offset in range(episodes)
-        ]
+            results.append(result)
+            rows.append(
+                {
+                    "scenario": scenario.value,
+                    "reward": result.total_reward,
+                    "completed": result.metrics.completed_tasks,
+                    "throughput": result.metrics.throughput,
+                    "turnaround": result.metrics.mean_turnaround_time,
+                }
+            )
         summaries[baseline.name] = {
             "reward": float(np.mean([result.total_reward for result in results])),
             "completed": float(np.mean([result.metrics.completed_tasks for result in results])),
@@ -663,6 +829,7 @@ def evaluate_baselines(
             "reward_diagnostics": mean_dict(
                 [result.reward_diagnostics for result in results]
             ),
+            "by_scenario": summarize_eval_rows(rows),
         }
     return summaries
 
@@ -672,6 +839,38 @@ def mean_dict(rows: list[dict[str, float]]) -> dict[str, float]:
         key: float(np.mean([row[key] for row in rows]))
         for key in rows[0]
     }
+
+
+def summarize_eval_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    by_scenario: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_scenario.setdefault(str(row["scenario"]), []).append(row)
+
+    summaries: dict[str, dict[str, float]] = {}
+    for scenario, scenario_rows in by_scenario.items():
+        keys = [
+            key
+            for key, value in scenario_rows[0].items()
+            if key != "scenario" and value is not None
+        ]
+        summaries[scenario] = {
+            key: float(
+                np.mean([
+                    row[key]
+                    for row in scenario_rows
+                    if row.get(key) is not None
+                ])
+            )
+            for key in keys
+        }
+    return summaries
+
+
+def count_labels(labels: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    return counts
 
 
 def summarize_rollout_actions(rollout: RolloutBuffer) -> dict[str, float]:
@@ -740,6 +939,7 @@ def build_log_row(
     metrics,
     stats,
     eval_summary: dict[str, float] | None,
+    train_scenarios: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     elapsed_times = [transition.elapsed_time for transition in rollout.transitions]
     return {
@@ -757,6 +957,7 @@ def build_log_row(
         "max_task_choices": rollout.max_task_choices,
         "forced_decision_fraction": rollout.forced_decision_fraction,
         "reward": total_reward,
+        "train_scenarios": train_scenarios or {},
         "transition_reward": float(
             sum(transition.reward for transition in rollout.transitions)
             / max(rollout.episodes, 1)
@@ -813,10 +1014,19 @@ def validate_checkpoint_version(checkpoint: dict[str, Any]) -> None:
 
 
 def serialize_args(args: argparse.Namespace) -> dict[str, Any]:
-    return {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in vars(args).items()
-    }
+    return {key: serialize_arg_value(value) for key, value in vars(args).items()}
+
+
+def serialize_arg_value(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, WorkloadScenario):
+        return value.value
+    if isinstance(value, tuple):
+        return [serialize_arg_value(item) for item in value]
+    if isinstance(value, list):
+        return [serialize_arg_value(item) for item in value]
+    return value
 
 
 class EvaluationPolicy:

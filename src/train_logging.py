@@ -64,7 +64,7 @@ def log_episode_train(
     metrics: Any,
     stats: Any,
 ) -> None:
-    """One compact progress line emitted every training episode."""
+    """One compact progress line emitted every training update iteration."""
 
     preempt_per_episode = rollout.preemptions / max(rollout.episodes, 1)
     entropy_coef = getattr(stats, "entropy_coef", 0.0)
@@ -115,11 +115,25 @@ def log_episode_eval(eval_summary: dict[str, Any]) -> None:
         eval_summary["sampled"]["actions"]["first_slot_fraction"],
     )
     logger.info(
-        "       base | random %+.3f  sjf %+.3f  eas %+.3f",
+        "       base | random %+.3f  mlfq %+.3f  sjf %+.3f  eas %+.3f",
         _baseline_reward(baselines, "random"),
+        _baseline_reward(baselines, "mlfq"),
         _baseline_reward(baselines, "sjf_like"),
         _baseline_reward(baselines, "eas_like"),
     )
+    for scenario in sorted(eval_summary.get("by_scenario", {})):
+        row = eval_summary["by_scenario"][scenario]
+        sampled_row = eval_summary.get("sampled", {}).get("by_scenario", {}).get(scenario, {})
+        logger.info(
+            "       eval/%s | reward %+.3f (sampled %+.3f) | base r/m/s/e %+.3f/%+.3f/%+.3f/%+.3f",
+            scenario,
+            _row_value(row, "reward"),
+            _row_value(sampled_row, "reward"),
+            _baseline_scenario_reward(baselines, "random", scenario),
+            _baseline_scenario_reward(baselines, "mlfq", scenario),
+            _baseline_scenario_reward(baselines, "sjf_like", scenario),
+            _baseline_scenario_reward(baselines, "eas_like", scenario),
+        )
 
 
 def _baseline_reward(baselines: dict[str, Any], name: str) -> float:
@@ -127,6 +141,23 @@ def _baseline_reward(baselines: dict[str, Any], name: str) -> float:
     if not entry or entry.get("reward") is None:
         return float("nan")
     return float(entry["reward"])
+
+
+def _baseline_scenario_reward(
+    baselines: dict[str, Any],
+    name: str,
+    scenario: str,
+) -> float:
+    entry = baselines.get(name, {})
+    by_scenario = entry.get("by_scenario", {})
+    return _row_value(by_scenario.get(scenario, {}), "reward")
+
+
+def _row_value(row: dict[str, Any], key: str) -> float:
+    value = row.get(key)
+    if value is None:
+        return float("nan")
+    return float(value)
 
 
 def _fmt(value: float | None, spec: str = ".3f") -> str:

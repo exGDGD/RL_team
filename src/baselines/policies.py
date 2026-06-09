@@ -94,6 +94,102 @@ class SJFLikePolicy:
 
 
 @dataclass
+class MLFQPolicy:
+    """OS-style multi-level feedback queue baseline.
+
+    This is intentionally not observation-fair: it tracks task identity through
+    ``pid`` and uses task runtime history. The simulator has no timer tick, so
+    quantum expiry cannot create a new decision point by itself. Instead, queue
+    levels are updated whenever the env asks for a scheduling decision.
+    """
+
+    levels: int = 3
+    quanta: tuple[float, ...] = (4.0, 12.0)
+    aging_threshold: float = 30.0
+    name: str = "mlfq"
+
+    def reset(self) -> None:
+        return None
+
+    def act(self, env: SchedulerEnv, observations: dict[str, dict]) -> dict[str, int]:
+        actions = {agent_id: 0 for agent_id in env.agents}
+        available = _available_actions(env)
+
+        for agent_id in env.agents:
+            if not available:
+                break
+            core = env.cores[agent_id]
+            if core.busy:
+                if not env._core_preempt_eligible(core):
+                    continue
+                best_action = self._best_action(env, available)
+                running_level = self._running_level(env, agent_id)
+                ready_level = self._effective_level(
+                    env.ready_queue[best_action - 1],
+                    env.sim.now,
+                )
+                if ready_level < running_level:
+                    actions[agent_id] = best_action
+                    available.remove(best_action)
+                continue
+
+            best_action = self._best_action(env, available)
+            actions[agent_id] = best_action
+            available.remove(best_action)
+
+        return actions
+
+    def _best_action(self, env: SchedulerEnv, available: list[int]) -> int:
+        now = env.sim.now
+        return min(
+            available,
+            key=lambda action: self._rank(env.ready_queue[action - 1], now),
+        )
+
+    def _rank(self, task: Task, now: float) -> tuple[int, float, int]:
+        return (
+            self._effective_level(task, now),
+            task.ready_since if task.ready_since is not None else task.arrival_time,
+            task.pid,
+        )
+
+    def _effective_level(self, task: Task, now: float) -> int:
+        base_level = self._base_level(task.cpu_progress)
+        if task.ready_since is None:
+            return base_level
+        promotions = int(task.waiting_time(now) // max(self.aging_threshold, 1.0e-8))
+        return max(0, base_level - promotions)
+
+    def _running_level(self, env: SchedulerEnv, agent_id: str) -> int:
+        core = env.cores[agent_id]
+        if core.current_task_pid is None:
+            return self.levels - 1
+        task = env.tasks[core.current_task_pid]
+        return self._base_level(task.cpu_progress + self._running_work_done(env, agent_id))
+
+    def _running_work_done(self, env: SchedulerEnv, agent_id: str) -> float:
+        core = env.cores[agent_id]
+        if core.task_started_at is None or core.current_task_pid is None:
+            return 0.0
+        elapsed = max(0.0, env.sim.now - core.task_started_at)
+        if elapsed <= 0.0:
+            return 0.0
+        task = env.tasks[core.current_task_pid]
+        mismatch = env._mismatch_penalty(core.core_type, task)
+        return elapsed * core.spec.speed / max(mismatch, 1.0e-8)
+
+    def _base_level(self, cpu_service: float) -> int:
+        level = 0
+        remaining_service = cpu_service
+        for quantum in self.quanta:
+            if remaining_service < quantum:
+                return min(level, self.levels - 1)
+            remaining_service -= quantum
+            level += 1
+        return min(level, self.levels - 1)
+
+
+@dataclass
 class EASLikePolicy:
     name: str = "eas_like"
 
