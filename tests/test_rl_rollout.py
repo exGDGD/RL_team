@@ -75,6 +75,49 @@ def test_collect_episode_records_idle_noop_as_transition() -> None:
     assert all(transition.action == 0 for transition in buffer.transitions)
 
 
+def test_noop_policy_counts_every_decision_as_noop() -> None:
+    """The rollout tracks how often the policy chose NO-OP (action 0). A policy
+    that only ever waits should report a NO-OP at every decision."""
+
+    env = SchedulerEnv(
+        core_config={CoreType.P: 1},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=0.5,
+        episode_time=30.0,
+        max_tasks=4,
+        seed=3,
+    )
+
+    buffer = collect_episode(env, NoOpPolicy(), seed=3, max_env_steps=3)
+
+    assert buffer.decisions > 0
+    assert buffer.noop_decisions == buffer.decisions
+    assert buffer.noop_fraction == pytest.approx(1.0)
+
+
+def test_dispatching_policy_records_fewer_noops_than_decisions() -> None:
+    """A policy that dispatches whenever a task is available leaves NO-OP only
+    for the (rarer) intervals with nothing to run, so the NO-OP count is a
+    strict, in-range subset of all decisions."""
+
+    env = SchedulerEnv(
+        core_config={CoreType.P: 1, CoreType.E: 1},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=1.0,
+        episode_time=40.0,
+        max_tasks=16,
+        seed=7,
+    )
+
+    buffer = collect_episode(env, FirstValidPolicy(), seed=7)
+
+    assert buffer.decisions > 0
+    assert 0 <= buffer.noop_decisions < buffer.decisions
+    assert buffer.noop_fraction == pytest.approx(
+        buffer.noop_decisions / buffer.decisions
+    )
+
+
 def test_collect_episode_with_preemption_records_consistent_transitions() -> None:
     """With preemption enabled a busy core can switch tasks mid-run. The rollout
     must record those switches as transitions without corrupting credit

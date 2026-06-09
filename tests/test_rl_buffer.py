@@ -1,7 +1,30 @@
 import numpy as np
 import pytest
 
-from src.rl import JointMacroTransition, RolloutBuffer, compute_time_scaled_gae
+from src.rl import (
+    JointMacroTransition,
+    ReplayBuffer,
+    RolloutBuffer,
+    compute_time_scaled_gae,
+)
+
+
+def _one_interval_rollout(reward: float) -> RolloutBuffer:
+    return RolloutBuffer(
+        episodes=1,
+        total_env_reward=reward,
+        joint_transitions=[
+            JointMacroTransition(
+                episode_id=0,
+                obs=object(),
+                reward=reward,
+                next_obs=object(),
+                elapsed_time=1.0,
+                terminated=True,
+                truncated=False,
+            )
+        ],
+    )
 
 
 def test_time_scaled_gae_matches_one_step_td_when_lambda_zero() -> None:
@@ -117,3 +140,45 @@ def test_rollout_buffer_extend_offsets_joint_episode_ids() -> None:
     target.extend(other)
 
     assert [transition.episode_id for transition in target.joint_transitions] == [0, 1]
+
+
+def test_replay_buffer_disabled_returns_only_current_rollout() -> None:
+    replay = ReplayBuffer(capacity=0)
+    replay.add(_one_interval_rollout(1.0))  # ignored when disabled
+
+    merged = replay.combined(_one_interval_rollout(2.0))
+
+    assert len(replay) == 0
+    assert merged.episodes == 1
+    assert len(merged.joint_transitions) == 1
+    assert merged.total_env_reward == pytest.approx(2.0)
+
+
+def test_replay_buffer_reuses_recent_rollouts_with_distinct_episode_ids() -> None:
+    replay = ReplayBuffer(capacity=2)
+    replay.add(_one_interval_rollout(1.0))
+    replay.add(_one_interval_rollout(2.0))
+
+    merged = replay.combined(_one_interval_rollout(3.0))
+
+    # current + 2 retained, each a self-contained episode.
+    assert merged.episodes == 3
+    assert [t.episode_id for t in merged.joint_transitions] == [0, 1, 2]
+    assert merged.total_env_reward == pytest.approx(6.0)
+
+
+def test_replay_buffer_evicts_beyond_capacity() -> None:
+    replay = ReplayBuffer(capacity=1)
+    replay.add(_one_interval_rollout(1.0))
+    replay.add(_one_interval_rollout(2.0))  # evicts the first
+
+    merged = replay.combined(_one_interval_rollout(3.0))
+
+    assert len(replay) == 1
+    assert merged.episodes == 2
+    assert merged.total_env_reward == pytest.approx(5.0)
+
+
+def test_replay_buffer_rejects_negative_capacity() -> None:
+    with pytest.raises(ValueError):
+        ReplayBuffer(capacity=-1)
