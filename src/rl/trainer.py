@@ -174,14 +174,18 @@ class TorchACACPolicy(nn.Module):
             rows = []
             for position in positions:
                 transition = transitions[position]
-                tensors = transition_row_to_tensors(transition, self.device)
-                tensors["action_mask"] = torch.as_tensor(
+                raw = _raw_rows_to_tensors(
+                    transition.obs, [transition.agent_index], self.device
+                )
+                # Use the stored effective mask (post claimed-slot), not the raw
+                # batch mask, to match the action that was actually sampled.
+                raw["action_mask"] = torch.as_tensor(
                     transition.action_mask,
                     dtype=torch.bool,
                     device=self.device,
                 ).unsqueeze(0)
-                rows.append(tensors)
-            batched = _stack_tensor_dicts(rows)
+                rows.append(raw)
+            batched = normalize_observation_tensors(_stack_tensor_dicts(rows))
             logits = self.actors[core_type.value](**_actor_inputs(batched))
             dist = Categorical(logits=logits)
             chosen = torch.tensor(
@@ -243,14 +247,13 @@ class TorchACACPolicy(nn.Module):
             counts = []
             for position in positions:
                 batch = batches[position]
-                tensors = batch_rows_to_tensors(
-                    batch,
-                    list(range(batch.num_agents)),
-                    self.device,
+                rows.append(
+                    _raw_rows_to_tensors(
+                        batch, list(range(batch.num_agents)), self.device
+                    )
                 )
-                rows.append(tensors)
                 counts.append(batch.num_agents)
-            batched = _stack_tensor_dicts(rows)
+            batched = normalize_observation_tensors(_stack_tensor_dicts(rows))
             flat_values = self.critic(**_critic_inputs(batched))
             start = 0
             for offset, position in enumerate(positions):
@@ -608,13 +611,19 @@ def _stack_tensor_dicts(
     return {key: torch.cat([row[key] for row in rows], dim=0) for key in rows[0]}
 
 
-def batch_rows_to_tensors(
+def _raw_rows_to_tensors(
     batch: AgentBatch,
     rows: list[int],
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
+    """Gather the given agent rows into fresh, un-normalized tensors.
+
+    numpy fancy-indexing always copies, so the returned tensors never alias the
+    source ``AgentBatch`` — ``normalize_observation_tensors`` can mutate them in
+    place safely.
+    """
     index = np.asarray(rows, dtype=np.int64)
-    tensors = {
+    return {
         "self_features": torch.as_tensor(batch.self_features[index], dtype=torch.float32, device=device),
         "ready_queue": torch.as_tensor(batch.ready_queue[index], dtype=torch.float32, device=device),
         "ready_mask": torch.as_tensor(batch.ready_mask[index], dtype=torch.float32, device=device),
@@ -623,52 +632,49 @@ def batch_rows_to_tensors(
         "system": torch.as_tensor(batch.system[index], dtype=torch.float32, device=device),
         "action_mask": torch.as_tensor(batch.action_mask[index], dtype=torch.bool, device=device),
     }
-    return normalize_observation_tensors(tensors)
+
+
+def batch_rows_to_tensors(
+    batch: AgentBatch,
+    rows: list[int],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    return normalize_observation_tensors(_raw_rows_to_tensors(batch, rows, device))
 
 
 def normalize_observation_tensors(
     tensors: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Keep heterogeneous simulator features in a stable range for MLP inputs."""
+    """Keep heterogeneous simulator features in a stable range for MLP inputs.
 
-    tensors = dict(tensors)
-    self_features = tensors["self_features"].clone()
+    Mutates ``tensors`` in place — the builders above hand it freshly allocated
+    tensors. Every step is per-row independent, so normalizing a stacked batch
+    once is identical to normalizing each row then stacking; the update path
+    relies on this to batch many transitions through a single call.
+    """
+
+    self_features = tensors["self_features"]
     # self = [core_type, busy, elapsed, energy, dt_since,
     #         running_latency_class, running_cpu_intensity, running_cpu_progress]
-    self_features[:, 0] = self_features[:, 0] / max(len(CoreType) - 1, 1)
+    self_features[:, 0] /= max(len(CoreType) - 1, 1)
     self_features[:, 2:5] = torch.log1p(self_features[:, 2:5])
-    self_features[:, 5] = self_features[:, 5] / 2.0
+    self_features[:, 5] /= 2.0
     self_features[:, 7] = torch.log1p(self_features[:, 7])
-    tensors["self_features"] = self_features
 
-    ready_queue = tensors["ready_queue"].clone()
+    ready_queue = tensors["ready_queue"]
     # [waiting_time, cpu_progress, latency_class, cpu_intensity]
     ready_queue[:, :, 0:2] = torch.log1p(ready_queue[:, :, 0:2])
-    ready_queue[:, :, 2] = ready_queue[:, :, 2] / 2.0
-    tensors["ready_queue"] = ready_queue
+    ready_queue[:, :, 2] /= 2.0
 
-    other_cores = tensors["other_cores"].clone()
+    other_cores = tensors["other_cores"]
     if other_cores.shape[1] > 0:
-        other_cores[:, :, 0] = other_cores[:, :, 0] / max(len(CoreType) - 1, 1)
+        other_cores[:, :, 0] /= max(len(CoreType) - 1, 1)
         other_cores[:, :, 2] = torch.log1p(other_cores[:, :, 2])
-    tensors["other_cores"] = other_cores
 
-    system = tensors["system"].clone()
-    system[:, 0] = system[:, 0] / 12.0
-    system[:, 2:] = system[:, 2:] / 12.0
-    tensors["system"] = system
+    system = tensors["system"]
+    system[:, 0] /= 12.0
+    system[:, 2:] /= 12.0
     return tensors
-
-
-def transition_row_to_tensors(
-    transition: AgentTransition,
-    device: torch.device,
-    *,
-    next_obs: bool = False,
-) -> dict[str, torch.Tensor]:
-    batch = transition.next_obs if next_obs else transition.obs
-    row = transition.next_agent_index if next_obs else transition.agent_index
-    return batch_rows_to_tensors(batch, [row], device)
 
 
 def _actor_inputs(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
