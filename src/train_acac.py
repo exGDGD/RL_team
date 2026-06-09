@@ -301,7 +301,7 @@ def run_training_loop(
             executor=executor,
         )
         if len(rollout) == 0:
-            logger.warning("ep %d skipped empty rollout", episode_idx)
+            logger.warning("iter %d skipped empty rollout", episode_idx)
             continue
 
         stats = trainer.update(rollout)
@@ -637,6 +637,7 @@ def evaluate_rl_policy(
     action_summaries = []
     preemptions = []
     scenario_labels = []
+    per_scenario_rows = []
     with preserve_torch_rng(seed=base_seed, enabled=not deterministic):
         for offset in range(episodes):
             scenario = scenarios[offset % len(scenarios)]
@@ -659,6 +660,16 @@ def evaluate_rl_policy(
             diagnostics.append(env.reward_diagnostics())
             action_summaries.append(summarize_rollout_actions(rollout))
             preemptions.append(rollout.preemptions)
+            per_scenario_rows.append(
+                {
+                    "scenario": scenario.value,
+                    "reward": rollout.total_env_reward,
+                    "completed": metrics.completed_tasks,
+                    "throughput": metrics.throughput,
+                    "preemptions": rollout.preemptions,
+                    "turnaround": metrics.mean_turnaround_time,
+                }
+            )
 
     return {
         "reward": float(np.mean(rewards)),
@@ -666,6 +677,7 @@ def evaluate_rl_policy(
         "throughput": float(np.mean(throughputs)),
         "preemptions": float(np.mean(preemptions)),
         "scenario_counts": count_labels(scenario_labels),
+        "by_scenario": summarize_eval_rows(per_scenario_rows),
         "reward_diagnostics": mean_dict(diagnostics),
         "actions": mean_dict(action_summaries),
     }
@@ -683,18 +695,29 @@ def evaluate_baselines(
     policies = [RandomPolicy(seed=base_seed), MLFQPolicy(), SJFLikePolicy(), EASLikePolicy()]
     summaries = {}
     for baseline in policies:
-        results = [
-            run_episode(
+        rows = []
+        results = []
+        for offset in range(episodes):
+            scenario = scenarios[offset % len(scenarios)]
+            result = run_episode(
                 make_env(
                     args,
                     seed=base_seed + offset,
-                    workload_scenario=scenarios[offset % len(scenarios)],
+                    workload_scenario=scenario,
                 ),
                 baseline,
                 seed=base_seed + offset,
             )
-            for offset in range(episodes)
-        ]
+            results.append(result)
+            rows.append(
+                {
+                    "scenario": scenario.value,
+                    "reward": result.total_reward,
+                    "completed": result.metrics.completed_tasks,
+                    "throughput": result.metrics.throughput,
+                    "turnaround": result.metrics.mean_turnaround_time,
+                }
+            )
         summaries[baseline.name] = {
             "reward": float(np.mean([result.total_reward for result in results])),
             "completed": float(np.mean([result.metrics.completed_tasks for result in results])),
@@ -709,6 +732,7 @@ def evaluate_baselines(
             "reward_diagnostics": mean_dict(
                 [result.reward_diagnostics for result in results]
             ),
+            "by_scenario": summarize_eval_rows(rows),
         }
     return summaries
 
@@ -718,6 +742,31 @@ def mean_dict(rows: list[dict[str, float]]) -> dict[str, float]:
         key: float(np.mean([row[key] for row in rows]))
         for key in rows[0]
     }
+
+
+def summarize_eval_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    by_scenario: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_scenario.setdefault(str(row["scenario"]), []).append(row)
+
+    summaries: dict[str, dict[str, float]] = {}
+    for scenario, scenario_rows in by_scenario.items():
+        keys = [
+            key
+            for key, value in scenario_rows[0].items()
+            if key != "scenario" and value is not None
+        ]
+        summaries[scenario] = {
+            key: float(
+                np.mean([
+                    row[key]
+                    for row in scenario_rows
+                    if row.get(key) is not None
+                ])
+            )
+            for key in keys
+        }
+    return summaries
 
 
 def count_labels(labels: list[str]) -> dict[str, int]:

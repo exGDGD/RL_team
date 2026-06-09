@@ -276,7 +276,7 @@ SJF-like policy의 선택을 label로 모아 actor imitation pretraining에 사�
 - 여러 episode rollout 수집
 - trainer update
 - deterministic/sample eval
-- random/SJF/EAS baseline 평가
+- random/MLFQ/SJF/EAS baseline 평가
 - `metrics.jsonl`, `train.log`, `latest.pt`, `best.pt` 저장
 
 기본 device는 `auto`다. CUDA가 있으면 CUDA, 없으면 CPU를 쓴다. CUDA 사용 시 TF32 matmul/conv를 켜서 Colab T4/Ampere 계열에서 MLP/attention forward를 빠르게 한다.
@@ -292,14 +292,15 @@ python -m src.train_acac \
 
 Worker process는 CPU policy snapshot으로 environment rollout만 수집하고, main process의 GPU policy는 PPO update에 사용된다. CUDA process fork 문제를 피하기 위해 `spawn` start method를 쓴다. 병렬 worker 결과는 seed 순서로 merge해 sequential collection과 episode id / joint index가 같도록 유지한다.
 
-Baseline 평가는 학습 policy에 의존하지 않으므로 같은 eval seed/config에서는 매번 같은 값이다. `cached_evaluate_baselines()`가 이를 캐시해서 eval 때마다 random/SJF/EAS episode를 다시 도는 비용을 줄인다.
+Baseline 평가는 학습 policy에 의존하지 않으므로 같은 eval seed/config에서는 매번 같은 값이다. `cached_evaluate_baselines()`가 이를 캐시해서 eval 때마다 random/MLFQ/SJF/EAS episode를 다시 도는 비용을 줄인다.
 
 중요한 로그:
 
 - `reward`: training rollout의 환경 총 reward 평균
 - `eval reward`: deterministic argmax 평가
 - `sampled`: 현재 stochastic policy sampling 평가
-- `base`: random/SJF/EAS baseline
+- `base`: random/MLFQ/SJF/EAS baseline
+- `eval/<scenario>`: scenario별 deterministic/sampled reward와 baseline reward
 - `entropy`: action distribution entropy
 - `clip`: PPO clipping 비율
 - `preempt`: rollout/eval에서 발생한 preemption 횟수

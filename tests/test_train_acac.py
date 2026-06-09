@@ -9,6 +9,7 @@ from src.train_acac import (
     reward_weights_from_args,
     rollout_scenarios,
     serialize_args,
+    summarize_eval_rows,
     training_scenario_counts,
     validate_checkpoint_version,
 )
@@ -105,4 +106,17 @@ def test_count_labels_records_eval_scenario_mix() -> None:
     assert count_labels(["balanced", "ui_heavy", "balanced"]) == {
         "balanced": 2,
         "ui_heavy": 1,
+    }
+
+
+def test_summarize_eval_rows_groups_by_scenario() -> None:
+    assert summarize_eval_rows(
+        [
+            {"scenario": "balanced", "reward": -10.0, "turnaround": 5.0},
+            {"scenario": "balanced", "reward": -14.0, "turnaround": None},
+            {"scenario": "ui_heavy", "reward": -3.0, "turnaround": 1.0},
+        ]
+    ) == {
+        "balanced": {"reward": -12.0, "turnaround": 5.0},
+        "ui_heavy": {"reward": -3.0, "turnaround": 1.0},
     }

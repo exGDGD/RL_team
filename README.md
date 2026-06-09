@@ -256,7 +256,7 @@ Validation/test에 사용한 scenario mix는 evaluation summary의 `scenario_cou
 
 학습 중 `outputs/acac_p2e2/`에 `metrics.jsonl`, `train.log`, `latest.pt`, `best.pt`가 생성됩니다. Colab 런타임 종료 후에도 보존하려면 `--output-dir`에 Google Drive 경로를 넘깁니다. 중단된 학습은 다음처럼 이어서 실행합니다.
 
-로그는 두 갈래로 나뉩니다. `metrics.jsonl`은 episode별 전체 지표를 담는 기계 판독용 구조화 기록이고, 콘솔과 `train.log`(`src/train_logging.py`)는 사람이 한눈에 훑기 위한 요약입니다. 매 episode `ep ... | reward ... | loss ...` 한 줄이 찍히고, 평가 episode에서는 그 아래로 `eval`(deterministic / sampled reward)과 `base`(random/sjf/eas baseline) 블록이 들여쓰여 추가됩니다. eval 줄의 `reward`는 argmax action을 쓰는 deterministic 평가, 괄호 안 `sampled`는 현재 확률 정책에서 action을 sampling한 평가입니다. 학습 초반에는 entropy가 높으므로 random baseline과 비교할 때 `sampled`도 함께 확인합니다.
+로그는 두 갈래로 나뉩니다. `metrics.jsonl`은 iteration별 전체 지표를 담는 기계 판독용 구조화 기록이고, 콘솔과 `train.log`(`src/train_logging.py`)는 사람이 한눈에 훑기 위한 요약입니다. 매 update iteration마다 `iter ... | reward ... | loss ...` 한 줄이 찍히고, 평가 iteration에서는 그 아래로 `eval`(deterministic / sampled reward), `base`(random/mlfq/sjf/eas baseline), 그리고 scenario별 `eval/<scenario>` 블록이 들여쓰여 추가됩니다. eval 줄의 `reward`는 argmax action을 쓰는 deterministic 평가, 괄호 안 `sampled`는 현재 확률 정책에서 action을 sampling한 평가입니다. 학습 초반에는 entropy가 높으므로 random baseline과 비교할 때 `sampled`도 함께 확인합니다.
 
 ```bash
 python -m src.train_acac \
