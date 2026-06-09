@@ -82,6 +82,35 @@ def _latest_baselines(rows: list[dict[str, Any]]) -> dict[str, float]:
     return {}
 
 
+def latest_scenario_summary(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per-scenario eval rewards from the most recent evaluated iteration.
+
+    Returns ``{scenario: {"rl", "rl_sampled", "random", "mlfq", "sjf_like",
+    "eas_like"}}`` (values are rewards or ``None`` when absent). Empty dict when
+    no row carries per-scenario eval data (single-scenario run or old log).
+    """
+    for row in reversed(rows):
+        by_scenario = _pluck(row, "evaluation", "by_scenario")
+        if not by_scenario:
+            continue
+        summary: dict[str, dict[str, Any]] = {}
+        for scenario in sorted(by_scenario):
+            summary[scenario] = {
+                "rl": _pluck(row, "evaluation", "by_scenario", scenario, "reward"),
+                "rl_sampled": _pluck(
+                    row, "evaluation", "sampled", "by_scenario", scenario, "reward"
+                ),
+                **{
+                    name: _pluck(
+                        row, "evaluation", "baselines", name, "by_scenario", scenario, "reward"
+                    )
+                    for name in ("random", "mlfq", "sjf_like", "eas_like")
+                },
+            }
+        return summary
+    return {}
+
+
 def plot_training_metrics(
     rows: list[dict[str, Any]],
     *,
