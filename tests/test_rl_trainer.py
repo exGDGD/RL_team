@@ -7,13 +7,17 @@ from pathlib import Path
 torch = pytest.importorskip("torch")
 
 from src.env import CoreType, SchedulerEnv, WorkloadScenario
-from src.rl import AgentBatch, ReplayBuffer, collect_episode
+from src.rl import AgentBatch, ReplayBuffer, build_agent_batch, collect_episode
 from src.rl.trainer import (
     ACACConfig,
     ACACTrainer,
     TorchACACPolicy,
+    _raw_rows_to_tensors,
+    _stack_tensor_dicts,
+    batch_rows_to_tensors,
     compute_joint_advantages,
     map_actor_advantages,
+    normalize_observation_tensors,
 )
 from src.train_acac import CHECKPOINT_VERSION, append_jsonl, save_checkpoint
 
@@ -27,6 +31,53 @@ class FirstValidPolicy:
             actions[agent_id] = valid[0] if bool(batch.decision_mask[row]) and valid else 0
             log_probs[agent_id] = 0.0
         return actions, log_probs
+
+
+def _sample_batch(seed: int = 5):
+    env = SchedulerEnv(
+        core_config={CoreType.P: 2, CoreType.E: 2},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=1.0,
+        episode_time=30.0,
+        max_tasks=16,
+        seed=seed,
+    )
+    observations, _ = env.reset(seed=seed)
+    return build_agent_batch(observations, agent_order=env.agents)
+
+
+def test_normalize_batched_equals_per_row() -> None:
+    """The update path normalizes a stacked batch once instead of per row; this
+    must be bit-identical to normalizing each row and then stacking."""
+    batch = _sample_batch()
+    device = torch.device("cpu")
+    n = batch.num_agents
+
+    per_row = _stack_tensor_dicts(
+        [
+            normalize_observation_tensors(_raw_rows_to_tensors(batch, [i], device))
+            for i in range(n)
+        ]
+    )
+    batched = normalize_observation_tensors(
+        _stack_tensor_dicts([_raw_rows_to_tensors(batch, [i], device) for i in range(n)])
+    )
+
+    for key in per_row:
+        assert torch.equal(per_row[key], batched[key]), key
+
+
+def test_batch_rows_to_tensors_does_not_mutate_source_batch() -> None:
+    """In-place normalization must not corrupt the stored AgentBatch (numpy
+    fancy-indexing copies, so the tensors never alias the source)."""
+    batch = _sample_batch()
+    keys = ["self_features", "ready_queue", "other_cores", "system"]
+    snapshot = {k: np.array(getattr(batch, k), copy=True) for k in keys}
+
+    batch_rows_to_tensors(batch, list(range(batch.num_agents)), torch.device("cpu"))
+
+    for key in keys:
+        assert np.array_equal(getattr(batch, key), snapshot[key]), key
 
 
 def test_compute_advantages_groups_transitions_by_episode() -> None:
