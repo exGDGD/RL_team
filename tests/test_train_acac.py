@@ -121,6 +121,8 @@ def test_summarize_eval_rows_groups_by_scenario() -> None:
         "balanced": {"reward": -12.0, "turnaround": 5.0},
         "ui_heavy": {"reward": -3.0, "turnaround": 1.0},
     }
+
+
 def test_entropy_coef_constant_when_no_final_given() -> None:
     args = Namespace(entropy_coef=0.01, entropy_coef_final=None, episodes=100)
 

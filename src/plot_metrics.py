@@ -104,7 +104,7 @@ def plot_training_metrics(
             "`pip install matplotlib` (it is preinstalled on Colab)."
         ) from exc
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 11))
+    fig, axes = plt.subplots(4, 2, figsize=(14, 14))
     if title:
         fig.suptitle(title)
 
@@ -116,7 +116,12 @@ def plot_training_metrics(
     ax.plot(eval_x, eval_y, "o-", ms=3, color="C0", label="eval (deterministic)")
     samp_x, samp_y = _series(rows, "evaluation", "sampled", "reward")
     ax.plot(samp_x, samp_y, "o-", ms=3, color="C1", alpha=0.7, label="eval (sampled)")
-    for name, color in (("sjf_like", "C2"), ("eas_like", "C3"), ("random", "C4")):
+    for name, color in (
+        ("sjf_like", "C2"),
+        ("eas_like", "C3"),
+        ("mlfq", "C5"),
+        ("random", "C4"),
+    ):
         reward = _latest_baselines(rows).get(name)
         if reward is not None:
             ax.axhline(reward, ls="--", lw=1, color=color, label=f"{name} {reward:.0f}")
@@ -178,6 +183,26 @@ def plot_training_metrics(
     ax.set_ylim(0.0, 1.0)
     ax.set_title("decision mix")
     ax.legend(fontsize=8)
+
+    # --- Per-scenario eval reward (deterministic + sampled) ------------------
+    scenarios = sorted(
+        {
+            key
+            for row in rows
+            for key in (_pluck(row, "evaluation", "by_scenario") or {})
+        }
+    )
+    for ax, path, label in (
+        (axes[3, 0], ("evaluation", "by_scenario"), "deterministic"),
+        (axes[3, 1], ("evaluation", "sampled", "by_scenario"), "sampled"),
+    ):
+        for i, scenario in enumerate(scenarios):
+            xs, ys = _series(rows, *path, scenario, "reward")
+            if xs:
+                ax.plot(xs, ys, "o-", ms=3, color=f"C{i}", label=scenario)
+        ax.set_title(f"eval reward by scenario ({label})")
+        if scenarios:
+            ax.legend(fontsize=7)
 
     for ax in axes.flat:
         ax.set_xlabel("iteration")

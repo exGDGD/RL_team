@@ -29,11 +29,22 @@ def _row(episode: int, *, eval_row: bool) -> dict:
     row["evaluation"] = (
         {
             "reward": -720.0,
-            "sampled": {"reward": -735.0},
+            "sampled": {
+                "reward": -735.0,
+                "by_scenario": {
+                    "balanced": {"reward": -740.0},
+                    "ui_heavy": {"reward": -745.0},
+                },
+            },
             "baselines": {
                 "sjf_like": {"reward": -745.9},
                 "eas_like": {"reward": -848.2},
+                "mlfq": {"reward": -800.0},
                 "random": {"reward": -955.8},
+            },
+            "by_scenario": {
+                "balanced": {"reward": -700.0},
+                "ui_heavy": {"reward": -720.0},
             },
         }
         if eval_row
@@ -61,8 +72,8 @@ def test_plot_training_metrics_writes_png(tmp_path: Path) -> None:
     fig = plot_training_metrics(rows, save_path=out, title="test run")
 
     assert out.exists() and out.stat().st_size > 0
-    # 3x2 grid of panels.
-    assert len(fig.axes) >= 6
+    # 4x2 grid of panels (plus twin axes for entropy/KL).
+    assert len(fig.axes) >= 8
 
 
 def test_plot_handles_rows_without_new_fields(tmp_path: Path) -> None:
