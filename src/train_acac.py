@@ -215,7 +215,7 @@ def main() -> None:
         start_episode = int(checkpoint["episode"]) + 1
         best_eval_reward = float(checkpoint.get("best_eval_reward", float("-inf")))
         logger.info(
-            "resumed checkpoint=%s next_episode=%d", args.resume, start_episode
+            "resumed checkpoint=%s next_iter=%d", args.resume, start_episode
         )
 
     logger.info("=== ACAC single-config sanity training ===")
@@ -286,7 +286,7 @@ def run_training_loop(
             executor=executor,
         )
         if len(rollout) == 0:
-            logger.warning("ep %d skipped empty rollout", episode_idx)
+            logger.warning("iter %d skipped empty rollout", episode_idx)
             continue
 
         entropy_coef = entropy_coef_at(args, episode_idx)
@@ -431,33 +431,59 @@ def collect_training_rollout(
     gamma: float,
     episode_idx: int,
     executor,
-) -> tuple[RolloutBuffer, Any]:
+) -> tuple[RolloutBuffer, dict[str, Any]]:
     """Collect ``rollout_episodes`` episodes and merge them in seed order.
 
     Merging in seed order (not completion order) keeps episode ids and joint
     indices identical to sequential collection, so credit assignment is
     unchanged regardless of which worker finished first. Returns the merged
-    buffer and the metrics of the last-seed episode (matching the sequential
-    ``env.metrics()`` used for logging).
+    buffer and the per-field **mean** of the episode metrics across all rollout
+    episodes, so the logged done/throughput/turnaround describe the whole batch
+    instead of a single (last-seed) episode.
     """
 
     seeds = rollout_seeds(args, episode_idx)
     rollout = RolloutBuffer()
-    last_metrics = None
+    episode_metrics: list[Any] = []
 
     if executor is None:
         for seed in seeds:
             env = make_env(args, seed=seed)
             rollout.extend(collect_episode(env, policy, seed=seed, gamma=gamma))
-            last_metrics = env.metrics()
-        return rollout, last_metrics
+            episode_metrics.append(env.metrics())
+        return rollout, aggregate_episode_metrics(episode_metrics)
 
     cpu_state = {key: value.detach().cpu() for key, value in policy.state_dict().items()}
     tasks = [(cpu_state, seed, gamma) for seed in seeds]
     for buffer, metrics in executor.map(_run_rollout_worker, tasks):
         rollout.extend(buffer)
-        last_metrics = metrics
-    return rollout, last_metrics
+        episode_metrics.append(metrics)
+    return rollout, aggregate_episode_metrics(episode_metrics)
+
+
+def aggregate_episode_metrics(metrics_list: list[Any]) -> dict[str, Any]:
+    """Mean of each ``EpisodeMetrics`` field across the rollout episodes.
+
+    Task counts become floats (e.g. ``31.4``). ``None`` fields (percentiles for
+    an episode that completed nothing) are dropped from the mean; a field that
+    is ``None`` in every episode stays ``None``. ``per_core_utilization`` is
+    averaged per core. Empty input returns an empty dict.
+    """
+    if not metrics_list:
+        return {}
+    return _mean_nested([metrics.as_dict() for metrics in metrics_list])
+
+
+def _mean_nested(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in rows[0]:
+        values = [row[key] for row in rows]
+        if isinstance(values[0], dict):
+            result[key] = _mean_nested(values)
+        else:
+            present = [value for value in values if value is not None]
+            result[key] = float(np.mean(present)) if present else None
+    return result
 
 
 def entropy_coef_at(args: argparse.Namespace, episode_idx: int) -> float:
@@ -737,7 +763,7 @@ def build_log_row(
         ),
         "mean_elapsed_time": float(np.mean(elapsed_times)),
         "actions": summarize_rollout_actions(rollout),
-        "metrics": metrics.as_dict(),
+        "metrics": metrics,
         "update": asdict(stats),
         "evaluation": eval_summary,
     }
@@ -773,7 +799,7 @@ def save_checkpoint(
     temp_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(checkpoint, temp_path)
     temp_path.replace(path)
-    get_logger().info("saved checkpoint=%s episode=%d", path, episode_idx)
+    get_logger().info("saved checkpoint=%s iter=%d", path, episode_idx)
 
 
 def validate_checkpoint_version(checkpoint: dict[str, Any]) -> None:
