@@ -23,6 +23,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 def load_metrics(path: str | Path) -> list[dict[str, Any]]:
     """Read a JSONL metrics file into a list of row dicts (blank lines skipped)."""
@@ -111,14 +113,51 @@ def latest_scenario_summary(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
     return {}
 
 
+def _clip_floor(
+    ax,
+    values: list[Any],
+    override: float | None = None,
+    *,
+    keep_visible: list[Any] = (),
+) -> None:
+    """Clip a reward axis's lower bound so a few very-negative eval points don't
+    compress the meaningful range.
+
+    A deterministic policy that completes nothing scores an enormous negative
+    reward (e.g. -14000 vs the usual -700..-3000), which otherwise flattens
+    every other curve. ``override`` sets an explicit floor; without it the floor
+    is the 5th percentile of the plotted values (so a small fraction of extreme
+    outliers clip off the bottom while the bulk stays visible). ``keep_visible``
+    values (e.g. baseline reference lines) are never clipped.
+    """
+    finite = [float(v) for v in values if v is not None and np.isfinite(v)]
+    if override is not None:
+        ax.set_ylim(bottom=override)
+        return
+    if len(finite) < 4:
+        return
+    floor = float(np.percentile(finite, 5))
+    keep = [float(v) for v in keep_visible if v is not None and np.isfinite(v)]
+    if keep:
+        floor = min(floor, min(keep))
+    top = max(finite + keep)
+    pad = 0.03 * (top - floor) if top > floor else (abs(floor) * 0.03 or 1.0)
+    ax.set_ylim(bottom=floor - pad)
+
+
 def plot_training_metrics(
     rows: list[dict[str, Any]],
     *,
     save_path: str | Path | None = None,
     show: bool = False,
     title: str | None = None,
+    reward_floor: float | None = None,
 ):
-    """Render a 3x2 panel of training curves and optionally save/show it.
+    """Render a 4x2 panel of training curves and optionally save/show it.
+
+    ``reward_floor`` sets an explicit lower y-limit on the reward panels (the
+    aggregate one and the two per-scenario ones); when ``None`` a robust
+    automatic floor clips off extreme eval spikes (see ``_clip_floor``).
 
     Returns the matplotlib Figure so callers (e.g. notebooks) can tweak it.
     """
@@ -145,17 +184,19 @@ def plot_training_metrics(
     ax.plot(eval_x, eval_y, "o-", ms=3, color="C0", label="eval (deterministic)")
     samp_x, samp_y = _series(rows, "evaluation", "sampled", "reward")
     ax.plot(samp_x, samp_y, "o-", ms=3, color="C1", alpha=0.7, label="eval (sampled)")
+    baselines = _latest_baselines(rows)
     for name, color in (
         ("sjf_like", "C2"),
         ("eas_like", "C3"),
         ("mlfq", "C5"),
         ("random", "C4"),
     ):
-        reward = _latest_baselines(rows).get(name)
+        reward = baselines.get(name)
         if reward is not None:
             ax.axhline(reward, ls="--", lw=1, color=color, label=f"{name} {reward:.0f}")
     ax.set_title("reward (higher = better)")
     ax.legend(fontsize=8, loc="best")
+    _clip_floor(ax, train_y + eval_y + samp_y, reward_floor, keep_visible=list(baselines.values()))
 
     # --- Loss components -----------------------------------------------------
     ax = axes[0, 1]
@@ -225,13 +266,16 @@ def plot_training_metrics(
         (axes[3, 0], ("evaluation", "by_scenario"), "deterministic"),
         (axes[3, 1], ("evaluation", "sampled", "by_scenario"), "sampled"),
     ):
+        panel_ys: list[Any] = []
         for i, scenario in enumerate(scenarios):
             xs, ys = _series(rows, *path, scenario, "reward")
             if xs:
                 ax.plot(xs, ys, "o-", ms=3, color=f"C{i}", label=scenario)
+                panel_ys.extend(ys)
         ax.set_title(f"eval reward by scenario ({label})")
         if scenarios:
             ax.legend(fontsize=7)
+        _clip_floor(ax, panel_ys, reward_floor)
 
     for ax in axes.flat:
         ax.set_xlabel("iteration")
@@ -256,11 +300,27 @@ def main() -> None:
         help="Output image path (default: metrics.png next to the input).",
     )
     parser.add_argument("--show", action="store_true", help="Display the figure window.")
+    parser.add_argument(
+        "--reward-floor",
+        type=float,
+        default=None,
+        help=(
+            "Explicit lower y-limit for the reward panels. Default clips a "
+            "robust automatic floor so extreme eval spikes don't compress the "
+            "curves."
+        ),
+    )
     args = parser.parse_args()
 
     out = args.out or args.metrics.with_name("metrics.png")
     rows = load_metrics(args.metrics)
-    plot_training_metrics(rows, save_path=out, show=args.show, title=str(args.metrics))
+    plot_training_metrics(
+        rows,
+        save_path=out,
+        show=args.show,
+        title=str(args.metrics),
+        reward_floor=args.reward_floor,
+    )
     print(f"saved plot={out} (iterations={len(rows)})")
 
 
