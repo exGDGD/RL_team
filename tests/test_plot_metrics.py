@@ -93,6 +93,29 @@ def test_plot_training_metrics_writes_png(tmp_path: Path) -> None:
     assert len(fig.axes) >= 8
 
 
+def test_plot_reward_floor_clips_extreme_eval(tmp_path: Path) -> None:
+    """A single degenerate deterministic-eval spike (e.g. completes nothing)
+    must not drag the reward axis down and compress every other curve."""
+    rows = [_row(i, eval_row=(i % 2 == 1)) for i in range(1, 11)]
+    spike = _row(11, eval_row=True)
+    spike["evaluation"]["reward"] = -14000.0  # normal range is ~ -700..-955
+    rows.append(spike)
+
+    fig = plot_training_metrics(rows, save_path=tmp_path / "c.png")
+    bottom = fig.axes[0].get_ylim()[0]
+
+    assert bottom > -3000.0  # the -14000 spike is clipped off the bottom
+    assert bottom < -955.0  # the worst baseline (random -955.8) stays visible
+
+
+def test_plot_reward_floor_explicit_override(tmp_path: Path) -> None:
+    rows = [_row(i, eval_row=(i % 2 == 1)) for i in range(1, 6)]
+
+    fig = plot_training_metrics(rows, save_path=tmp_path / "c.png", reward_floor=-2000.0)
+
+    assert fig.axes[0].get_ylim()[0] == pytest.approx(-2000.0)
+
+
 def test_latest_scenario_summary_extracts_rl_and_baselines() -> None:
     rows = [_row(i, eval_row=(i % 2 == 1)) for i in range(1, 5)]
 
