@@ -198,6 +198,18 @@ def plot_training_metrics(
     ax.legend(fontsize=8, loc="best")
     _clip_floor(ax, train_y + eval_y + samp_y, reward_floor, keep_visible=list(baselines.values()))
 
+    # Overlay the scenario-balanced checkpoint score on a right axis: the honest
+    # convergence/early-stop signal that the burst-dominated aggregate reward
+    # hides (a flat aggregate can mask a policy that peaks then drifts).
+    score_x, score_y = _series(rows, "evaluation", "balanced_score")
+    if score_x:
+        ax_score = ax.twinx()
+        ax_score.plot(score_x, score_y, "s-", ms=3, color="k", lw=1.3, label="balanced_score")
+        ax_score.axhline(1.0, ls=":", lw=0.8, color="0.6")  # matched best baseline
+        ax_score.axhline(0.0, ls=":", lw=0.8, color="0.6")  # no better than random
+        ax_score.set_ylabel("balanced_score (0=random, 1=best baseline)")
+        ax_score.legend(loc="lower right", fontsize=7)
+
     # --- Loss components -----------------------------------------------------
     ax = axes[0, 1]
     for key, label in (("loss", "loss"), ("policy_loss", "policy"), ("value_loss", "value")):

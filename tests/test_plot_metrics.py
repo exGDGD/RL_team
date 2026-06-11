@@ -34,6 +34,7 @@ def _row(episode: int, *, eval_row: bool) -> dict:
     row["evaluation"] = (
         {
             "reward": -720.0,
+            "balanced_score": 0.5 - episode * 0.03,
             "sampled": {
                 "reward": -735.0,
                 "by_scenario": {
@@ -106,6 +107,25 @@ def test_plot_reward_floor_clips_extreme_eval(tmp_path: Path) -> None:
 
     assert bottom > -3000.0  # the -14000 spike is clipped off the bottom
     assert bottom < -955.0  # the worst baseline (random -955.8) stays visible
+
+
+def test_plot_overlays_balanced_score_axis(tmp_path: Path) -> None:
+    """The reward panel gains a right-axis balanced_score curve when present."""
+    rows = [_row(i, eval_row=(i % 2 == 1)) for i in range(1, 6)]
+
+    fig = plot_training_metrics(rows, save_path=tmp_path / "c.png")
+
+    assert any("balanced_score" in ax.get_ylabel() for ax in fig.axes)
+
+
+def test_plot_without_balanced_score_has_no_score_axis(tmp_path: Path) -> None:
+    rows = [_row(i, eval_row=True) for i in range(1, 4)]
+    for row in rows:
+        row["evaluation"].pop("balanced_score")
+
+    fig = plot_training_metrics(rows, save_path=tmp_path / "c.png")
+
+    assert not any("balanced_score" in ax.get_ylabel() for ax in fig.axes)
 
 
 def test_plot_reward_floor_explicit_override(tmp_path: Path) -> None:
