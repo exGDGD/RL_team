@@ -164,6 +164,23 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--advantage-norm",
+        type=str,
+        default="global",
+        choices=["global", "per_scenario", "per_episode"],
+        help=(
+            "Advantage normalization scope. 'global' (default) standardizes "
+            "advantages across the whole merged rollout, so the "
+            "largest-magnitude scenario (e.g. burst_stress) dominates the "
+            "gradient. 'per_scenario' (recommended for multi-scenario training) "
+            "standardizes within each workload scenario, equalizing scenarios of "
+            "very different reward magnitude while keeping the genuine "
+            "between-episode spread within a scenario. 'per_episode' standardizes "
+            "every rollout episode on its own (also flattens within-scenario "
+            "episode differences)."
+        ),
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="auto",
@@ -222,6 +239,7 @@ def main() -> None:
         entropy_coef=args.entropy_coef,
         update_epochs=args.update_epochs,
         num_minibatches=args.num_minibatches,
+        advantage_norm=args.advantage_norm,
     )
     policy = TorchACACPolicy(config, device=args.device)
     if args.pretrained_actors is not None:
@@ -238,7 +256,9 @@ def main() -> None:
     latest_path = args.output_dir / "latest.pt"
     best_path = args.output_dir / "best.pt"
     start_episode = 1
-    best_eval_reward = float("-inf")
+    # Best-checkpoint selection score (scenario-balanced, scale-free — see
+    # checkpoint_score). Persisted under the legacy "best_eval_reward" key.
+    best_eval_score = float("-inf")
 
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=policy.device, weights_only=False)
@@ -246,7 +266,7 @@ def main() -> None:
         policy.load_state_dict(checkpoint["model_state_dict"])
         trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_episode = int(checkpoint["episode"]) + 1
-        best_eval_reward = float(checkpoint.get("best_eval_reward", float("-inf")))
+        best_eval_score = float(checkpoint.get("best_eval_reward", float("-inf")))
         logger.info(
             "resumed checkpoint=%s next_iter=%d", args.resume, start_episode
         )
@@ -287,7 +307,7 @@ def main() -> None:
             latest_path=latest_path,
             best_path=best_path,
             start_episode=start_episode,
-            best_eval_reward=best_eval_reward,
+            best_eval_score=best_eval_score,
         )
         if args.test_episodes > 0:
             if best_path.exists():
@@ -305,6 +325,7 @@ def main() -> None:
                 episodes=args.test_episodes,
                 scenarios=args.test_scenarios,
             )
+            test_summary["balanced_score"] = checkpoint_score(test_summary)
             append_jsonl(
                 metrics_path,
                 {
@@ -333,7 +354,7 @@ def run_training_loop(
     latest_path: Path,
     best_path: Path,
     start_episode: int,
-    best_eval_reward: float,
+    best_eval_score: float,
 ) -> None:
     replay = ReplayBuffer(capacity=getattr(args, "replay_capacity", 0))
     for episode_idx in range(start_episode, args.episodes + 1):
@@ -367,6 +388,10 @@ def run_training_loop(
             if should_eval
             else None
         )
+        if eval_summary is not None:
+            # Scenario-balanced, scale-free selection score (see checkpoint_score);
+            # recorded in the log row and used to pick best.pt below.
+            eval_summary["balanced_score"] = checkpoint_score(eval_summary)
         log_row = build_log_row(
             episode_idx=episode_idx,
             rollout=rollout,
@@ -388,8 +413,13 @@ def run_training_loop(
 
         if eval_summary is not None:
             log_episode_eval(eval_summary)
-            if eval_summary["reward"] > best_eval_reward:
-                best_eval_reward = eval_summary["reward"]
+            # Fall back to aggregate reward only when per-scenario baselines are
+            # unavailable (consistent within a run, so still comparable).
+            score = eval_summary["balanced_score"]
+            if score is None:
+                score = eval_summary["reward"]
+            if score > best_eval_score:
+                best_eval_score = score
                 save_checkpoint(
                     torch=torch,
                     path=best_path,
@@ -398,7 +428,7 @@ def run_training_loop(
                     trainer=trainer,
                     config=config,
                     args=args,
-                    best_eval_reward=best_eval_reward,
+                    best_eval_reward=best_eval_score,
                     eval_summary=eval_summary,
                 )
 
@@ -411,7 +441,7 @@ def run_training_loop(
                 trainer=trainer,
                 config=config,
                 args=args,
-                best_eval_reward=best_eval_reward,
+                best_eval_reward=best_eval_score,
                 eval_summary=eval_summary,
             )
 
@@ -564,7 +594,9 @@ def collect_training_rollout(
     if executor is None:
         for seed, scenario in zip(seeds, scenarios, strict=True):
             env = make_env(args, seed=seed, workload_scenario=scenario)
-            rollout.extend(collect_episode(env, policy, seed=seed, gamma=gamma))
+            episode_buffer = collect_episode(env, policy, seed=seed, gamma=gamma)
+            episode_buffer.episode_scenarios[0] = scenario.value
+            rollout.extend(episode_buffer)
             episode_metrics.append(env.metrics())
         return rollout, aggregate_episode_metrics(episode_metrics)
 
@@ -573,7 +605,11 @@ def collect_training_rollout(
         (cpu_state, seed, gamma, scenario)
         for seed, scenario in zip(seeds, scenarios, strict=True)
     ]
-    for buffer, metrics in executor.map(_run_rollout_worker, tasks):
+    for (_, _, _, scenario), (buffer, metrics) in zip(
+        tasks, executor.map(_run_rollout_worker, tasks), strict=True
+    ):
+        # Worker buffers carry one episode (id 0); tag it before the offset merge.
+        buffer.episode_scenarios[0] = scenario.value
         rollout.extend(buffer)
         episode_metrics.append(metrics)
     return rollout, aggregate_episode_metrics(episode_metrics)
@@ -929,6 +965,57 @@ def preserve_torch_rng(*, seed: int, enabled: bool):
         torch.random.set_rng_state(cpu_state)
         if cuda_states is not None:
             torch.cuda.set_rng_state_all(cuda_states)
+
+
+def checkpoint_score(eval_summary: dict[str, Any]) -> float | None:
+    """Scenario-balanced, scale-free score for picking the best checkpoint.
+
+    The aggregate eval reward is dominated by the highest-magnitude scenario
+    (burst_stress rewards are ~6x balanced), so selecting ``best.pt`` on it
+    biases the saved policy toward that one scenario. Instead, for each scenario
+    we measure how far the deterministic policy closed the gap from the random
+    baseline to the strongest baseline::
+
+        gap = (rl - random) / (best_baseline - random)
+
+    ``gap=0`` means "no better than random", ``gap=1`` means "matched the best
+    heuristic", ``>1`` means it beat every baseline. Scenarios are weighted
+    equally (simple mean), so no single scenario can dominate the selection.
+    Returns ``None`` when the per-scenario baseline data is unavailable (the
+    caller then falls back to the aggregate reward).
+    """
+    by_scenario = eval_summary.get("by_scenario") or {}
+    baselines = eval_summary.get("baselines") or {}
+    if not by_scenario or not baselines:
+        return None
+
+    gaps: list[float] = []
+    for scenario, row in by_scenario.items():
+        rl_reward = row.get("reward")
+        if rl_reward is None:
+            continue
+        baseline_rewards = [
+            value
+            for entry in baselines.values()
+            if (value := entry.get("by_scenario", {}).get(scenario, {}).get("reward"))
+            is not None
+        ]
+        random_reward = (
+            baselines.get("random", {})
+            .get("by_scenario", {})
+            .get(scenario, {})
+            .get("reward")
+        )
+        if random_reward is None or not baseline_rewards:
+            continue
+        denominator = max(baseline_rewards) - random_reward
+        if denominator <= 1e-9:  # all baselines tie random — nothing to normalize against
+            continue
+        gaps.append((rl_reward - random_reward) / denominator)
+
+    if not gaps:
+        return None
+    return float(np.mean(gaps))
 
 
 def build_log_row(

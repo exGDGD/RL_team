@@ -71,6 +71,9 @@ class RolloutBuffer:
     noop_decisions: int = 0
     total_task_choices: int = 0
     max_task_choices: int = 0
+    # episode_id -> workload scenario label, for per-scenario advantage
+    # normalization. Populated by the training collector; empty otherwise.
+    episode_scenarios: dict[int, str] = field(default_factory=dict)
 
     def append(self, transition: AgentTransition) -> None:
         self.transitions.append(transition)
@@ -95,6 +98,10 @@ class RolloutBuffer:
             )
             for transition in other.joint_transitions
         )
+        # Re-offset the scenario labels with the same episode-id shift the
+        # transitions above received (self.episodes is still the pre-merge count).
+        for episode_id, scenario in other.episode_scenarios.items():
+            self.episode_scenarios[episode_id + self.episodes] = scenario
         self.episodes += other.episodes
         self.total_env_reward += other.total_env_reward
         self.env_steps += other.env_steps
