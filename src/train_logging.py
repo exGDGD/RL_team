@@ -105,10 +105,11 @@ def log_episode_eval(eval_summary: dict[str, Any]) -> None:
     logger = get_logger()
     baselines = eval_summary.get("baselines", {})
     logger.info(
-        "       eval | reward %+.3f (sampled %+.3f) | done %.1f | preempt %.1f "
+        "       eval | reward %+.3f (sampled %+.3f) | score %s | done %.1f | preempt %.1f "
         "| first_slot %.2f/%.2f",
         eval_summary["reward"],
         eval_summary["sampled"]["reward"],
+        _fmt(eval_summary.get("balanced_score")),
         eval_summary["completed"],
         eval_summary.get("preemptions", float("nan")),
         eval_summary["actions"]["first_slot_fraction"],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -35,6 +36,11 @@ class ACACConfig:
     update_epochs: int = 2
     num_minibatches: int = 1
     reward_scale: float = 0.01
+    # "global": standardize advantages across the whole merged rollout (the
+    # largest-magnitude scenario then dominates the policy gradient).
+    # "per_episode": standardize within each rollout episode so every scenario
+    # contributes an equal-scale gradient regardless of its raw reward scale.
+    advantage_norm: str = "global"
 
 
 @dataclass(frozen=True)
@@ -369,7 +375,13 @@ class ACACTrainer:
         )
         advantages_t = torch.tensor(advantages, dtype=torch.float32, device=self.policy.device)
         returns_t = torch.tensor(joint_returns, dtype=torch.float32, device=self.policy.device)
-        advantages_t = normalize_advantages(advantages_t)
+        if self.config.advantage_norm == "global":
+            advantages_t = normalize_advantages(advantages_t)
+        else:
+            advantages_t = normalize_advantages_by_group(
+                advantages_t,
+                advantage_group_ids(actor_transitions, rollout, self.config.advantage_norm),
+            )
 
         # Each learnable actor transition is credited to the macro-interval it
         # started in (``joint_index``); grouping lets a minibatch of intervals
@@ -585,6 +597,55 @@ def normalize_advantages(advantages: torch.Tensor, eps: float = 1.0e-8) -> torch
     if advantages.numel() <= 1:
         return advantages
     return (advantages - advantages.mean()) / (advantages.std(unbiased=False) + eps)
+
+
+def advantage_group_ids(
+    actor_transitions: list[AgentTransition],
+    rollout: RolloutBuffer,
+    mode: str,
+) -> list[Any]:
+    """Group key per actor transition for grouped advantage normalization.
+
+    ``per_scenario`` keeps all episodes of one workload scenario in a single
+    group (preserving the genuine between-episode advantage spread within a
+    scenario while equalizing across scenarios of different reward magnitude).
+    ``per_episode`` groups each rollout episode on its own. ``per_scenario``
+    falls back to per-episode grouping when the rollout carries no scenario
+    labels (e.g. a raw single-scenario buffer in tests).
+    """
+    scenarios = getattr(rollout, "episode_scenarios", None) or {}
+    if mode == "per_scenario" and scenarios:
+        return [
+            scenarios.get(transition.episode_id, str(transition.episode_id))
+            for transition in actor_transitions
+        ]
+    return [transition.episode_id for transition in actor_transitions]
+
+
+def normalize_advantages_by_group(
+    advantages: torch.Tensor,
+    group_ids: list[Any],
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    """Standardize advantages within each group (per scenario or per episode).
+
+    A *global* normalization divides every advantage by one shared std, which is
+    dominated by the highest-variance scenario (burst_stress rewards are ~6x
+    balanced), shrinking the low-magnitude scenarios' advantages toward zero so
+    they barely train. Normalizing each group independently makes every scenario
+    contribute an equal-scale gradient regardless of its raw reward magnitude. A
+    singleton group collapses to 0 (a single sample carries no relative-advantage
+    signal).
+    """
+    if advantages.numel() <= 1:
+        return advantages
+    groups = np.asarray(group_ids)
+    result = advantages.clone()
+    for group in np.unique(groups):
+        idx = torch.from_numpy(np.nonzero(groups == group)[0]).to(advantages.device)
+        values = advantages.index_select(0, idx)
+        result[idx] = (values - values.mean()) / (values.std(unbiased=False) + eps)
+    return result
 
 
 def normalize_entropy(

@@ -14,9 +14,12 @@ from src.rl.trainer import (
     TorchACACPolicy,
     _raw_rows_to_tensors,
     _stack_tensor_dicts,
+    advantage_group_ids,
     batch_rows_to_tensors,
     compute_joint_advantages,
     map_actor_advantages,
+    normalize_advantages,
+    normalize_advantages_by_group,
     normalize_observation_tensors,
 )
 from src.train_acac import CHECKPOINT_VERSION, append_jsonl, save_checkpoint
@@ -173,6 +176,62 @@ def test_update_reports_supplied_entropy_coefficient() -> None:
     stats = trainer.update(rollout, entropy_coef=0.05)
 
     assert stats.entropy_coef == pytest.approx(0.05)
+
+
+def test_normalize_advantages_by_group_standardizes_each_group() -> None:
+    """Each group is centered to zero mean and unit std independently, so two
+    groups whose raw magnitudes differ 100x both end at the same scale."""
+    advantages = torch.tensor([10.0, 20.0, 30.0, 0.1, 0.2, 0.3])
+    groups = ["big", "big", "big", "small", "small", "small"]
+
+    out = normalize_advantages_by_group(advantages, groups)
+
+    for name in ("big", "small"):
+        sel = out[[i for i, g in enumerate(groups) if g == name]]
+        assert sel.mean().abs().item() < 1e-5
+        assert abs(sel.std(unbiased=False).item() - 1.0) < 1e-5
+
+
+def test_normalize_advantages_by_group_matches_global_for_single_group() -> None:
+    """With one group, grouped normalization is identical to the global one."""
+    advantages = torch.tensor([1.0, -2.0, 3.0, 0.5])
+
+    grouped = normalize_advantages_by_group(advantages, ["s", "s", "s", "s"])
+    glob = normalize_advantages(advantages.clone())
+
+    assert torch.allclose(grouped, glob, atol=1e-6)
+
+
+def test_advantage_group_ids_prefers_scenarios_then_falls_back_to_episode() -> None:
+    rollout = _balanced_rollout(seed=3)
+    actor = [t for t in rollout.transitions if np.count_nonzero(t.action_mask) > 1]
+
+    # No scenario labels -> group by episode id.
+    assert advantage_group_ids(actor, rollout, "per_scenario") == [
+        t.episode_id for t in actor
+    ]
+    # With labels -> group by scenario value.
+    rollout.episode_scenarios = {t.episode_id: "balanced" for t in actor}
+    assert advantage_group_ids(actor, rollout, "per_scenario") == ["balanced"] * len(actor)
+
+
+def test_per_scenario_advantage_norm_runs_update() -> None:
+    current = _balanced_rollout(seed=3)
+    replay = ReplayBuffer(capacity=1)
+    replay.add(_balanced_rollout(seed=4))
+    merged = replay.combined(current)
+    # Two episodes (ids 0 and 1) tagged as different scenarios.
+    merged.episode_scenarios = {0: "balanced", 1: "burst_stress"}
+
+    policy = TorchACACPolicy(
+        ACACConfig(hidden_dim=16, critic_heads=4, advantage_norm="per_scenario")
+    )
+    trainer = ACACTrainer(policy)
+
+    stats = trainer.update(merged)
+
+    assert np.isfinite(stats.loss)
+    assert stats.actor_samples == _learnable_actor_samples(merged)
 
 
 def test_update_on_replayed_rollout_trains_on_merged_samples() -> None:
