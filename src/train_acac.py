@@ -118,6 +118,27 @@ def main() -> None:
     parser.add_argument("--reward-scale", type=float, default=0.01)
     parser.add_argument("--actor-learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--critic-learning-rate", type=float, default=3.0e-4)
+    parser.add_argument(
+        "--lr-anneal-final-frac",
+        type=float,
+        default=1.0,
+        help=(
+            "Linearly decay both learning rates to this fraction of their "
+            "initial value over training. 1.0 (default) keeps them constant. "
+            "Set <1 (e.g. 0.1) so update steps shrink as the policy converges — "
+            "without it the advantage normalization keeps step size constant and "
+            "the policy never settles (KL/clip stay flat, eval drifts)."
+        ),
+    )
+    parser.add_argument(
+        "--lr-anneal-episodes",
+        type=int,
+        default=None,
+        help=(
+            "Episodes over which the learning rate reaches its final fraction. "
+            "None (default) uses the full --episodes budget."
+        ),
+    )
     parser.add_argument("--clip-ratio", type=float, default=0.05)
     parser.add_argument(
         "--entropy-coef",
@@ -357,6 +378,10 @@ def run_training_loop(
     best_eval_score: float,
 ) -> None:
     replay = ReplayBuffer(capacity=getattr(args, "replay_capacity", 0))
+    # Base LRs come from config (not the optimizer) so a resumed run re-derives
+    # the schedule from scratch instead of compounding a previously-scaled LR.
+    lr_annealing = float(getattr(args, "lr_anneal_final_frac", 1.0)) != 1.0
+    base_lrs = [config.actor_learning_rate, config.critic_learning_rate]
     for episode_idx in range(start_episode, args.episodes + 1):
         rollout, metrics = collect_training_rollout(
             policy,
@@ -369,6 +394,10 @@ def run_training_loop(
             logger.warning("iter %d skipped empty rollout", episode_idx)
             continue
 
+        if lr_annealing:
+            lr_scale = lr_scale_at(args, episode_idx)
+            for group, base in zip(trainer.optimizer.param_groups, base_lrs):
+                group["lr"] = base * lr_scale
         entropy_coef = entropy_coef_at(args, episode_idx)
         # Reuse recent rollouts (no-op when --replay-capacity 0); the current
         # rollout stays untouched so the logged diagnostics describe this episode.
@@ -400,6 +429,7 @@ def run_training_loop(
             stats=stats,
             eval_summary=eval_summary,
             train_scenarios=training_scenario_counts(args, episode_idx),
+            lr=trainer.optimizer.param_groups[0]["lr"],
         )
         append_jsonl(metrics_path, log_row)
 
@@ -660,6 +690,26 @@ def entropy_coef_at(args: argparse.Namespace, episode_idx: int) -> float:
     anneal_episodes = max(1, int(anneal_episodes))
     progress = min(1.0, max(0.0, (episode_idx - 1) / max(1, anneal_episodes - 1)))
     return start + (final - start) * progress
+
+
+def lr_scale_at(args: argparse.Namespace, episode_idx: int) -> float:
+    """Linear learning-rate multiplier (1.0 -> ``--lr-anneal-final-frac``).
+
+    Returns 1.0 when annealing is disabled (final fraction == 1.0). Otherwise
+    interpolates from 1.0 to the final fraction over ``--lr-anneal-episodes``
+    (defaulting to the full ``--episodes`` budget) and holds it afterwards. Same
+    schedule shape as :func:`entropy_coef_at`.
+    """
+
+    final_frac = float(getattr(args, "lr_anneal_final_frac", 1.0))
+    if final_frac == 1.0:
+        return 1.0
+    anneal_episodes = getattr(args, "lr_anneal_episodes", None) or getattr(
+        args, "episodes", 1
+    )
+    anneal_episodes = max(1, int(anneal_episodes))
+    progress = min(1.0, max(0.0, (episode_idx - 1) / max(1, anneal_episodes - 1)))
+    return 1.0 + (final_frac - 1.0) * progress
 
 
 def reward_weights_from_args(args: argparse.Namespace) -> RewardWeights:
@@ -1027,10 +1077,12 @@ def build_log_row(
     stats,
     eval_summary: dict[str, float] | None,
     train_scenarios: dict[str, int] | None = None,
+    lr: float | None = None,
 ) -> dict[str, Any]:
     elapsed_times = [transition.elapsed_time for transition in rollout.transitions]
     return {
         "episode": episode_idx,
+        "lr": lr,
         "transitions": len(rollout),
         "joint_intervals": len(rollout.joint_transitions),
         "env_steps": rollout.env_steps,

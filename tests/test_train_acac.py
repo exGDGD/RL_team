@@ -7,6 +7,8 @@ from src.train_acac import (
     checkpoint_score,
     count_labels,
     parse_workload_scenarios,
+    entropy_coef_at,
+    lr_scale_at,
     reward_weights_from_args,
     rollout_scenarios,
     serialize_args,
@@ -205,3 +207,27 @@ def test_entropy_coef_holds_final_value_after_anneal_window() -> None:
     assert entropy_coef_at(args, 10) == pytest.approx(0.005)
     # Past the anneal window the coefficient is clamped to the final value.
     assert entropy_coef_at(args, 80) == pytest.approx(0.005)
+
+
+def test_lr_scale_constant_when_anneal_disabled() -> None:
+    args = Namespace(lr_anneal_final_frac=1.0, lr_anneal_episodes=None, episodes=100)
+
+    assert lr_scale_at(args, 1) == pytest.approx(1.0)
+    assert lr_scale_at(args, 50) == pytest.approx(1.0)
+    assert lr_scale_at(args, 100) == pytest.approx(1.0)
+
+
+def test_lr_scale_anneals_linearly_to_final_fraction() -> None:
+    args = Namespace(lr_anneal_final_frac=0.1, lr_anneal_episodes=None, episodes=11)
+
+    assert lr_scale_at(args, 1) == pytest.approx(1.0)
+    assert lr_scale_at(args, 6) == pytest.approx(0.55)  # halfway: 1.0 -> 0.1
+    assert lr_scale_at(args, 11) == pytest.approx(0.1)
+
+
+def test_lr_scale_holds_final_after_window_and_uses_own_horizon() -> None:
+    args = Namespace(lr_anneal_final_frac=0.1, lr_anneal_episodes=10, episodes=100)
+
+    assert lr_scale_at(args, 10) == pytest.approx(0.1)
+    # Clamped to the final fraction past the (shorter) anneal window.
+    assert lr_scale_at(args, 80) == pytest.approx(0.1)
