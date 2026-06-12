@@ -137,6 +137,35 @@ def log_episode_eval(eval_summary: dict[str, Any]) -> None:
         )
 
 
+def log_scenario_significance(significance: dict[str, Any]) -> None:
+    """Per-scenario RL-vs-best-baseline gap with 95% CI, to judge sample size.
+
+    ``sig=YES`` means the sample resolves the gap (|Δ| > 95% half-interval);
+    ``NO`` means it does not -- that scenario needs more eval/test episodes
+    before the comparison can be trusted.
+    """
+
+    if not significance:
+        return
+    logger = get_logger()
+    logger.info("       signif | RL vs best baseline (Δ ± 95% CI; sig=YES if |Δ|>CI -> sample resolves it)")
+    for scenario in sorted(significance):
+        s = significance[scenario]
+        mark = "?" if s["significant"] is None else ("YES" if s["significant"] else "NO ")
+        logger.info(
+            "       signif/%-12s n=%-3d | rl %+8.1f ±%5.1f vs %-8s %+8.1f | Δ %+7.1f ± %5.1f | sig=%s",
+            scenario,
+            s["n"],
+            s["rl"],
+            s["rl_se"],
+            s["best_baseline"],
+            s["best"],
+            s["delta"],
+            s["half_ci"],
+            mark,
+        )
+
+
 def _baseline_reward(baselines: dict[str, Any], name: str) -> float:
     entry = baselines.get(name)
     if not entry or entry.get("reward") is None:

@@ -11,11 +11,13 @@ import numpy as np
 
 from src.env import CoreType, RewardWeights, SchedulerEnv, WorkloadScenario
 from src.rl import ReplayBuffer, RolloutBuffer, collect_episode
+from src.plot_metrics import summarize_scenario_significance
 from src.train_logging import (
     configure_logging,
     get_logger,
     log_episode_eval,
     log_episode_train,
+    log_scenario_significance,
 )
 
 
@@ -376,6 +378,7 @@ def main() -> None:
             )
             logger.info("=== held-out test ===")
             log_episode_eval(test_summary)
+            log_scenario_significance(summarize_scenario_significance(test_summary))
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
@@ -968,6 +971,15 @@ def summarize_eval_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, float
             )
             for key in keys
         }
+        # Per-scenario reward spread + count, so consumers can form the standard
+        # error (std/sqrt(n)) and judge whether the sample is large enough for an
+        # RL-vs-baseline comparison to be meaningful (see summarize_scenario_
+        # significance in plot_metrics).
+        rewards = [row["reward"] for row in scenario_rows if row.get("reward") is not None]
+        summaries[scenario]["n"] = len(rewards)
+        summaries[scenario]["reward_std"] = (
+            float(np.std(rewards, ddof=1)) if len(rewards) > 1 else 0.0
+        )
     return summaries
 
 

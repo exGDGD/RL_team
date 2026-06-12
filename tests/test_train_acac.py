@@ -113,6 +113,8 @@ def test_count_labels_records_eval_scenario_mix() -> None:
 
 
 def test_summarize_eval_rows_groups_by_scenario() -> None:
+    # Now also reports per-scenario reward spread (sample std, ddof=1) and count
+    # so consumers can form the standard error (std/sqrt(n)).
     assert summarize_eval_rows(
         [
             {"scenario": "balanced", "reward": -10.0, "turnaround": 5.0},
@@ -120,8 +122,13 @@ def test_summarize_eval_rows_groups_by_scenario() -> None:
             {"scenario": "ui_heavy", "reward": -3.0, "turnaround": 1.0},
         ]
     ) == {
-        "balanced": {"reward": -12.0, "turnaround": 5.0},
-        "ui_heavy": {"reward": -3.0, "turnaround": 1.0},
+        "balanced": {
+            "reward": -12.0,
+            "turnaround": 5.0,
+            "n": 2,
+            "reward_std": pytest.approx(8.0**0.5),
+        },
+        "ui_heavy": {"reward": -3.0, "turnaround": 1.0, "n": 1, "reward_std": 0.0},
     }
 
 
