@@ -205,9 +205,8 @@ def plot_training_metrics(
     if score_x:
         ax_score = ax.twinx()
         ax_score.plot(score_x, score_y, "s-", ms=3, color="k", lw=1.3, label="balanced_score")
-        ax_score.axhline(1.0, ls=":", lw=0.8, color="0.6")  # matched best baseline
-        ax_score.axhline(0.0, ls=":", lw=0.8, color="0.6")  # no better than random
-        ax_score.set_ylabel("balanced_score (0=random, 1=best baseline)")
+        ax_score.axhline(0.0, ls=":", lw=0.8, color="0.6")  # 0 = matched best baseline
+        ax_score.set_ylabel("balanced_score (0=best baseline, <0 behind)")
         ax_score.legend(loc="lower right", fontsize=7)
 
     # --- Loss components -----------------------------------------------------

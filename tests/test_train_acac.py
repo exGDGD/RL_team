@@ -139,32 +139,45 @@ def _eval_summary_with_scenarios(rl_by_scenario: dict[str, float]) -> dict:
     }
 
 
-def test_checkpoint_score_one_when_matching_best_baseline() -> None:
+def test_checkpoint_score_zero_when_matching_best_baseline() -> None:
     summary = _eval_summary_with_scenarios({"a": -50.0, "b": -500.0})
-    assert checkpoint_score(summary) == pytest.approx(1.0)
-
-
-def test_checkpoint_score_zero_when_matching_random() -> None:
-    summary = _eval_summary_with_scenarios({"a": -100.0, "b": -1000.0})
     assert checkpoint_score(summary) == pytest.approx(0.0)
 
 
-def test_checkpoint_score_weights_scenarios_equally_despite_magnitude() -> None:
-    # 'a' matches the best baseline (gap 1), 'b' only matches random (gap 0).
-    # Equal weighting -> 0.5; a reward-magnitude-weighted score would be ~0 since
-    # 'b' is 10x larger. This is exactly the burst-stress bias we are removing.
-    summary = _eval_summary_with_scenarios({"a": -50.0, "b": -1000.0})
-    assert checkpoint_score(summary) == pytest.approx(0.5)
+def test_checkpoint_score_positive_when_beating_best_baseline() -> None:
+    # a: (-40 - -50)/50 = +0.2 ; b: (-450 - -500)/500 = +0.1 -> mean 0.15
+    summary = _eval_summary_with_scenarios({"a": -40.0, "b": -450.0})
+    assert checkpoint_score(summary) == pytest.approx(0.15)
 
 
-def test_checkpoint_score_can_disagree_with_aggregate_reward() -> None:
-    # 'balanced' policy: equal mid gaps -> score 0.6; aggregate reward -475.
-    balanced = checkpoint_score(_eval_summary_with_scenarios({"a": -50.0, "b": -900.0}))
-    # 'b-biased' policy: better aggregate reward (-320) but lower balanced score.
-    biased = checkpoint_score(_eval_summary_with_scenarios({"a": -90.0, "b": -550.0}))
-    assert balanced == pytest.approx(0.6)
-    assert biased == pytest.approx(0.55)
-    assert balanced > biased  # balanced metric prefers the scenario-even policy
+def test_checkpoint_score_weights_fixed_delta_more_in_low_magnitude_scenario() -> None:
+    # Same absolute 25-reward miss vs the best baseline in both scenarios, but it
+    # is 0.5 of |best| in the small scenario 'a' and only 0.05 in the big 'b'.
+    summary = _eval_summary_with_scenarios({"a": -75.0, "b": -525.0})
+    assert checkpoint_score(summary) == pytest.approx((-0.5 + -0.05) / 2)
+
+
+def test_checkpoint_score_clamps_a_catastrophic_scenario() -> None:
+    # 'a' is 9x worse than best (rel -9) but clamps to -1 so it can't swamp the
+    # mean; 'b' matches best (0) -> mean -0.5 (unclamped would be -4.5).
+    summary = _eval_summary_with_scenarios({"a": -500.0, "b": -500.0})
+    assert checkpoint_score(summary) == pytest.approx(-0.5)
+
+
+def test_checkpoint_score_stable_when_baselines_bunch() -> None:
+    # Baselines within a few points of each other: a (rl-random)/(best-random)
+    # span would explode, but dividing by |best_baseline| stays bounded.
+    summary = {
+        "reward": -1.0,
+        "by_scenario": {"ui": {"reward": -756.0}},
+        "baselines": {
+            "random": {"by_scenario": {"ui": {"reward": -711.0}}},
+            "mlfq": {"by_scenario": {"ui": {"reward": -705.0}}},
+            "sjf_like": {"by_scenario": {"ui": {"reward": -703.0}}},
+        },
+    }
+    # best = -703, rel = (-756 - -703)/703 = -0.0754 (not an explosion)
+    assert checkpoint_score(summary) == pytest.approx(-53.0 / 703.0)
 
 
 def test_checkpoint_score_none_without_scenario_baselines() -> None:
