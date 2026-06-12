@@ -11,7 +11,7 @@ import numpy as np
 
 from src.env import CoreType, RewardWeights, SchedulerEnv, WorkloadScenario
 from src.rl import ReplayBuffer, RolloutBuffer, collect_episode
-from src.plot_metrics import summarize_scenario_significance
+from src.plot_metrics import ORACLE_BASELINES, summarize_scenario_significance
 from src.train_logging import (
     configure_logging,
     get_logger,
@@ -1057,21 +1057,20 @@ def checkpoint_score(eval_summary: dict[str, Any]) -> float | None:
     The aggregate eval reward is dominated by the highest-magnitude scenario
     (burst_stress rewards are ~6x balanced), so selecting ``best.pt`` on it
     biases the saved policy toward that one scenario. Instead, for each scenario
-    we score the deterministic policy by its reward gap to the *strongest*
-    baseline, as a fraction of that baseline's magnitude::
+    we score the deterministic policy by its reward gap to the strongest
+    *realistic* (non-oracle) baseline, as a fraction of that baseline's magnitude::
 
-        rel = (rl - best_baseline) / |best_baseline|   (clamped to +/-1)
+        rel = (rl - best_realistic_baseline) / |best_realistic_baseline|   (clamped +/-1)
 
-    ``rel=0`` means "matched the best heuristic", ``>0`` beat it by that
-    fraction, ``<0`` behind it by that fraction. Dividing by ``|best_baseline|``
-    (always large) keeps the score stable even when the baselines bunch together
-    -- a ``(rl-random)/(best-random)`` span explodes when ``best ~= random``
-    (e.g. ui_heavy, where every heuristic does about equally well). Scenarios are
-    weighted equally, and because the denominator scales with the scenario a
-    fixed reward delta counts more in a low-magnitude scenario (balanced) than a
-    high one (burst) -- matching how much that delta actually means. The clamp
-    stops one catastrophic scenario from swamping the mean. Returns ``None`` when
-    per-scenario baseline data is unavailable (caller falls back to aggregate).
+    ``rel=0`` means "matched the best fair heuristic", ``>0`` beat it by that
+    fraction, ``<0`` behind it. SJF-like is excluded because it is clairvoyant
+    (an oracle ceiling, not a fair target -- see ``ORACLE_BASELINES``). Dividing
+    by ``|best|`` (always large) keeps the score stable even when baselines bunch
+    together. Scenarios are weighted equally, and because the denominator scales
+    with the scenario a fixed reward delta counts more in a low-magnitude scenario
+    (balanced) than a high one (burst) -- matching how much it actually means. The
+    clamp stops one catastrophic scenario from swamping the mean. Returns ``None``
+    when per-scenario baseline data is unavailable (caller falls back to aggregate).
     """
     by_scenario = eval_summary.get("by_scenario") or {}
     baselines = eval_summary.get("baselines") or {}
@@ -1085,8 +1084,9 @@ def checkpoint_score(eval_summary: dict[str, Any]) -> float | None:
             continue
         baseline_rewards = [
             value
-            for entry in baselines.values()
-            if (value := entry.get("by_scenario", {}).get(scenario, {}).get("reward"))
+            for name, entry in baselines.items()
+            if name not in ORACLE_BASELINES
+            and (value := entry.get("by_scenario", {}).get(scenario, {}).get("reward"))
             is not None
         ]
         if not baseline_rewards:

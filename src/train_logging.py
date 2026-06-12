@@ -138,22 +138,30 @@ def log_episode_eval(eval_summary: dict[str, Any]) -> None:
 
 
 def log_scenario_significance(significance: dict[str, Any]) -> None:
-    """Per-scenario RL-vs-best-baseline gap with 95% CI, to judge sample size.
+    """Per-scenario RL vs best *realistic* baseline (+ SJF oracle ceiling).
 
-    ``sig=YES`` means the sample resolves the gap (|Δ| > 95% half-interval);
-    ``NO`` means it does not -- that scenario needs more eval/test episodes
-    before the comparison can be trusted.
+    ``WIN``/``LOSE`` = the sample resolves a real gap vs the best fair heuristic
+    (random/mlfq/eas); ``tie`` = not resolved at this n. SJF is the clairvoyant
+    oracle ceiling, reported as ``oracle_gap`` -- not a fair target.
     """
 
     if not significance:
         return
     logger = get_logger()
-    logger.info("       signif | RL vs best baseline (Δ ± 95% CI; sig=YES if |Δ|>CI -> sample resolves it)")
+    logger.info(
+        "       signif | RL vs best REALISTIC baseline (Δ ± 95% CI; WIN/LOSE if resolved) | SJF oracle gap"
+    )
     for scenario in sorted(significance):
         s = significance[scenario]
-        mark = "?" if s["significant"] is None else ("YES" if s["significant"] else "NO ")
+        if s["significant"] is None:
+            verdict = "?   "
+        elif not s["significant"]:
+            verdict = "tie "
+        else:
+            verdict = "WIN " if s["delta"] > 0 else "LOSE"
+        oracle = "" if s["oracle"] is None else f" | oracle %+.1f gap %+.1f" % (s["oracle"], s["oracle_gap"])
         logger.info(
-            "       signif/%-12s n=%-3d | rl %+8.1f ±%5.1f vs %-8s %+8.1f | Δ %+7.1f ± %5.1f | sig=%s",
+            "       signif/%-12s n=%-3d | rl %+8.1f ±%5.1f vs %-8s %+8.1f | Δ %+7.1f ±%5.1f %s%s",
             scenario,
             s["n"],
             s["rl"],
@@ -162,7 +170,8 @@ def log_scenario_significance(significance: dict[str, Any]) -> None:
             s["best"],
             s["delta"],
             s["half_ci"],
-            mark,
+            verdict,
+            oracle,
         )
 
 

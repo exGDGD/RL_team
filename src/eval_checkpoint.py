@@ -85,7 +85,7 @@ def format_report(
     meta: dict[str, Any] | None = None,
 ) -> str:
     """Render a copy-paste-friendly text report (table + significance)."""
-    from src.plot_metrics import summarize_scenario_significance
+    from src.plot_metrics import ORACLE_BASELINES, summarize_scenario_significance
     from src.train_acac import checkpoint_score
 
     meta = meta or {}
@@ -93,14 +93,16 @@ def format_report(
     lines = [
         f"checkpoint={checkpoint} iter={meta.get('episode')} | "
         f"balanced_score={'-' if score is None else f'{score:+.3f}'} "
-        "(0=best baseline, <0 behind)"
+        "(0=best realistic baseline, >0 beats it; SJF=clairvoyant oracle ceiling, not a target)"
     ]
 
     def fmt(value: Any) -> str:
         return "-" if value is None else f"{value:.1f}"
 
+    # Mark the clairvoyant oracle column so the table is not read as a fair target.
+    cols = [f"{c}*" if c in ORACLE_BASELINES else c for c in _BASELINE_COLS]
     header = f"{'scenario':<13}{'n':>5}{'rl':>10}{'rl_smp':>10}" + "".join(
-        f"{col:>10}" for col in _BASELINE_COLS
+        f"{col:>10}" for col in cols
     )
     lines.append(header)
     by_scenario = summary.get("by_scenario", {})
@@ -120,14 +122,27 @@ def format_report(
     significance = summarize_scenario_significance(summary)
     if significance:
         lines.append("")
-        lines.append("significance | RL vs best baseline (Δ ± 95% CI; YES = sample resolves it):")
+        lines.append(
+            "vs best REALISTIC baseline (Δ ± 95% CI; WIN/LOSE if resolved) | SJF oracle ceiling:"
+        )
         for name in sorted(significance):
             s = significance[name]
-            mark = "?" if s["significant"] is None else ("YES" if s["significant"] else "NO ")
-            lines.append(
-                f"  {name:<13} n={s['n']:<4} rl {s['rl']:+9.1f} ±{s['rl_se']:5.1f} vs "
-                f"{s['best_baseline']:<8} {s['best']:+9.1f} | Δ {s['delta']:+8.1f} ± {s['half_ci']:5.1f} -> {mark}"
+            if s["significant"] is None:
+                verdict = "?   "
+            elif not s["significant"]:
+                verdict = "tie "
+            else:
+                verdict = "WIN " if s["delta"] > 0 else "LOSE"
+            oracle = (
+                ""
+                if s["oracle"] is None
+                else f" | oracle(sjf*) {s['oracle']:+9.1f} gap {s['oracle_gap']:+8.1f}"
             )
+            lines.append(
+                f"  {name:<13} n={s['n']:<4} rl {s['rl']:+9.1f}±{s['rl_se']:5.1f} vs "
+                f"{s['best_baseline']:<8} {s['best']:+9.1f} | Δ {s['delta']:+8.1f} ±{s['half_ci']:5.1f} {verdict}{oracle}"
+            )
+        lines.append("  (* SJF = clairvoyant oracle: knows job lengths; ceiling to approach, not a fair target)")
     return "\n".join(lines)
 
 

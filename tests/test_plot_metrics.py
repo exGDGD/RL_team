@@ -152,34 +152,51 @@ def test_latest_scenario_summary_extracts_rl_and_baselines() -> None:
     assert bal["random"] == pytest.approx(-950.0)
 
 
-def test_summarize_scenario_significance_flags_resolved_gaps() -> None:
+def test_summarize_scenario_significance_compares_realistic_and_reports_oracle() -> None:
     summary = {
         "by_scenario": {
             "x": {"reward": -100.0, "reward_std": 8.0, "n": 4},   # SE = 4.0
             "y": {"reward": -100.0, "reward_std": 20.0, "n": 4},  # SE = 10.0
         },
         "baselines": {
-            "sjf_like": {
+            "mlfq": {  # best realistic competitor
                 "by_scenario": {
                     "x": {"reward": -90.0, "reward_std": 4.0, "n": 16},  # SE = 1.0
-                    "y": {"reward": -95.0, "reward_std": 4.0, "n": 16},  # SE = 1.0
+                    "y": {"reward": -95.0, "reward_std": 4.0, "n": 16},
                 }
-            }
+            },
+            "sjf_like": {  # clairvoyant oracle -> reported as ceiling, not the competitor
+                "by_scenario": {
+                    "x": {"reward": -70.0, "reward_std": 2.0, "n": 16},
+                    "y": {"reward": -80.0, "reward_std": 2.0, "n": 16},
+                }
+            },
         },
     }
 
     sig = summarize_scenario_significance(summary)
 
-    assert sig["x"]["delta"] == pytest.approx(-10.0)
-    assert sig["x"]["best_baseline"] == "sjf_like"
-    assert sig["x"]["significant"] is True   # |-10| > 1.96*sqrt(16+1)=8.08
-    assert sig["y"]["significant"] is False  # |-5| < 1.96*sqrt(100+1)=19.7
+    assert sig["x"]["best_baseline"] == "mlfq"           # not sjf_like
+    assert sig["x"]["delta"] == pytest.approx(-10.0)     # vs mlfq, not the oracle
+    assert sig["x"]["significant"] is True               # |-10| > 1.96*sqrt(16+1)=8.08
+    assert sig["x"]["oracle"] == pytest.approx(-70.0)
+    assert sig["x"]["oracle_gap"] == pytest.approx(-30.0)  # rl - oracle
+    assert sig["y"]["significant"] is False              # |-5| < 1.96*sqrt(100+1)=19.7
+
+
+def test_summarize_scenario_significance_empty_without_realistic_baseline() -> None:
+    # Only the oracle present -> no fair competitor -> nothing to report.
+    summary = {
+        "by_scenario": {"x": {"reward": -100.0, "reward_std": 4.0, "n": 8}},
+        "baselines": {"sjf_like": {"by_scenario": {"x": {"reward": -90.0, "n": 8, "reward_std": 2.0}}}},
+    }
+    assert summarize_scenario_significance(summary) == {}
 
 
 def test_summarize_scenario_significance_empty_without_std() -> None:
     summary = {
         "by_scenario": {"x": {"reward": -100.0}},  # no n / reward_std (old log)
-        "baselines": {"sjf_like": {"by_scenario": {"x": {"reward": -90.0}}}},
+        "baselines": {"mlfq": {"by_scenario": {"x": {"reward": -90.0}}}},
     }
     assert summarize_scenario_significance(summary) == {}
 
