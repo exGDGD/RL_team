@@ -229,6 +229,25 @@ def main() -> None:
 
     logger = configure_logging(args.output_dir)
 
+    # Eval/test split scenarios round-robin; a count that is not a multiple of the
+    # scenario count samples some scenarios more than others (noisy per-scenario
+    # numbers, which feed the best-checkpoint score). Warn so it is not silent.
+    for split, episodes, scenarios in (
+        ("eval", args.eval_episodes, args.eval_scenarios),
+        ("test", args.test_episodes, args.test_scenarios),
+    ):
+        if episodes and len(scenarios) > 1 and episodes % len(scenarios) != 0:
+            logger.warning(
+                "%s-episodes=%d is not a multiple of %d scenarios -> uneven "
+                "per-scenario sampling (%d-%d each). Use a multiple of %d.",
+                split,
+                episodes,
+                len(scenarios),
+                episodes // len(scenarios),
+                -(-episodes // len(scenarios)),
+                len(scenarios),
+            )
+
     try:
         import torch
 
@@ -1017,29 +1036,37 @@ def preserve_torch_rng(*, seed: int, enabled: bool):
             torch.cuda.set_rng_state_all(cuda_states)
 
 
+CHECKPOINT_SCORE_CLAMP = 1.0
+
+
 def checkpoint_score(eval_summary: dict[str, Any]) -> float | None:
     """Scenario-balanced, scale-free score for picking the best checkpoint.
 
     The aggregate eval reward is dominated by the highest-magnitude scenario
     (burst_stress rewards are ~6x balanced), so selecting ``best.pt`` on it
     biases the saved policy toward that one scenario. Instead, for each scenario
-    we measure how far the deterministic policy closed the gap from the random
-    baseline to the strongest baseline::
+    we score the deterministic policy by its reward gap to the *strongest*
+    baseline, as a fraction of that baseline's magnitude::
 
-        gap = (rl - random) / (best_baseline - random)
+        rel = (rl - best_baseline) / |best_baseline|   (clamped to +/-1)
 
-    ``gap=0`` means "no better than random", ``gap=1`` means "matched the best
-    heuristic", ``>1`` means it beat every baseline. Scenarios are weighted
-    equally (simple mean), so no single scenario can dominate the selection.
-    Returns ``None`` when the per-scenario baseline data is unavailable (the
-    caller then falls back to the aggregate reward).
+    ``rel=0`` means "matched the best heuristic", ``>0`` beat it by that
+    fraction, ``<0`` behind it by that fraction. Dividing by ``|best_baseline|``
+    (always large) keeps the score stable even when the baselines bunch together
+    -- a ``(rl-random)/(best-random)`` span explodes when ``best ~= random``
+    (e.g. ui_heavy, where every heuristic does about equally well). Scenarios are
+    weighted equally, and because the denominator scales with the scenario a
+    fixed reward delta counts more in a low-magnitude scenario (balanced) than a
+    high one (burst) -- matching how much that delta actually means. The clamp
+    stops one catastrophic scenario from swamping the mean. Returns ``None`` when
+    per-scenario baseline data is unavailable (caller falls back to aggregate).
     """
     by_scenario = eval_summary.get("by_scenario") or {}
     baselines = eval_summary.get("baselines") or {}
     if not by_scenario or not baselines:
         return None
 
-    gaps: list[float] = []
+    rels: list[float] = []
     for scenario, row in by_scenario.items():
         rl_reward = row.get("reward")
         if rl_reward is None:
@@ -1050,22 +1077,18 @@ def checkpoint_score(eval_summary: dict[str, Any]) -> float | None:
             if (value := entry.get("by_scenario", {}).get(scenario, {}).get("reward"))
             is not None
         ]
-        random_reward = (
-            baselines.get("random", {})
-            .get("by_scenario", {})
-            .get(scenario, {})
-            .get("reward")
-        )
-        if random_reward is None or not baseline_rewards:
+        if not baseline_rewards:
             continue
-        denominator = max(baseline_rewards) - random_reward
-        if denominator <= 1e-9:  # all baselines tie random — nothing to normalize against
+        best_baseline = max(baseline_rewards)
+        scale = abs(best_baseline)
+        if scale < 1e-9:
             continue
-        gaps.append((rl_reward - random_reward) / denominator)
+        rel = (rl_reward - best_baseline) / scale
+        rels.append(max(-CHECKPOINT_SCORE_CLAMP, min(CHECKPOINT_SCORE_CLAMP, rel)))
 
-    if not gaps:
+    if not rels:
         return None
-    return float(np.mean(gaps))
+    return float(np.mean(rels))
 
 
 def build_log_row(
