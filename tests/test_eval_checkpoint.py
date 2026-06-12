@@ -52,15 +52,20 @@ def test_assemble_summary_merges_scenarios() -> None:
     )
 
 
-def test_format_report_contains_score_table_and_significance() -> None:
+def test_format_report_contains_score_table_and_realistic_vs_oracle() -> None:
+    # mlfq = realistic competitor, sjf_like = oracle ceiling.
     merged = assemble_summary(
-        {"balanced": _fake_scenario_result("balanced", -800.0, {"sjf_like": -720.0, "random": -900.0})}
+        {
+            "balanced": _fake_scenario_result(
+                "balanced", -800.0, {"mlfq": -900.0, "sjf_like": -720.0}
+            )
+        }
     )
 
     report = format_report(merged, checkpoint="best.pt", meta={"episode": 180})
 
     assert "balanced_score" in report
     assert "iter=180" in report
-    assert "balanced" in report
-    # std/n present -> significance section rendered.
-    assert "significance" in report
+    assert "REALISTIC" in report   # fair-competitor section
+    assert "oracle" in report      # SJF ceiling reported separately
+    assert "WIN" in report         # rl -800 beats mlfq -900 (resolved)

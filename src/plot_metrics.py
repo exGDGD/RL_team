@@ -145,6 +145,14 @@ def _clip_floor(
     ax.set_ylim(bottom=floor - pad)
 
 
+# SJF-like ranks tasks by their true remaining runtime, i.e. it is clairvoyant
+# (knows each job's length). That is an ORACLE upper bound, not a fair competitor
+# the policy could match with the same observations -- so it is the ceiling to
+# approach, never the target to beat. Every other baseline (random/mlfq/eas) uses
+# only observable features and is a fair competitor.
+ORACLE_BASELINES = frozenset({"sjf_like"})
+
+
 def _reward_se(row: dict[str, Any]) -> float:
     """Standard error of a scenario's mean reward: std / sqrt(n) (0 if absent)."""
     n = row.get("n") or 0
@@ -157,15 +165,15 @@ def _reward_se(row: dict[str, Any]) -> float:
 def summarize_scenario_significance(
     summary: dict[str, Any] | None,
 ) -> dict[str, dict[str, Any]]:
-    """Per-scenario RL-vs-best-baseline reward gap with standard errors.
+    """Per-scenario RL vs best *realistic* baseline (+ SJF oracle ceiling).
 
-    For judging whether an eval/test sample is large enough: the gap ``Δ = rl -
-    best_baseline`` is only trustworthy when its 95% half-interval
-    (``1.96 * combined_SE``) is smaller than ``|Δ|``. ``SE = reward_std/sqrt(n)``
-    for each side, combined in quadrature. ``significant`` is True when
-    ``|Δ| > 1.96*SE`` (the sample resolves the difference), False when it does
-    not (need more episodes for that scenario), and ``None`` when SE is 0.
-    Returns ``{}`` when std/n are missing (older logs without them).
+    The fair comparison is RL vs the best non-oracle baseline (random/mlfq/eas):
+    ``Δ = rl - best_realistic``, with ``significant`` True when ``|Δ| > 1.96*SE``
+    (SE combined in quadrature from each side's std/sqrt(n)). ``Δ>0 & significant``
+    means RL beat the best fair heuristic. The clairvoyant SJF oracle is reported
+    separately as a ceiling: ``oracle`` (its reward) and ``oracle_gap = rl -
+    oracle`` (how much room a job-length-aware scheduler still has). Returns ``{}``
+    when std/n are missing or no realistic baseline is present.
     """
     by_scenario = (summary or {}).get("by_scenario") or {}
     baselines = (summary or {}).get("baselines") or {}
@@ -174,12 +182,17 @@ def summarize_scenario_significance(
         rl_mean = row.get("reward")
         if rl_mean is None or "n" not in row:
             continue
-        best_name, best_row = None, None
+        best_name, best_row, oracle_reward = None, None, None
         for name, entry in baselines.items():
             brow = (entry.get("by_scenario") or {}).get(scenario)
-            if brow and brow.get("reward") is not None:
-                if best_row is None or brow["reward"] > best_row["reward"]:
-                    best_name, best_row = name, brow
+            if not brow or brow.get("reward") is None:
+                continue
+            if name in ORACLE_BASELINES:
+                if oracle_reward is None or brow["reward"] > oracle_reward:
+                    oracle_reward = brow["reward"]
+                continue
+            if best_row is None or brow["reward"] > best_row["reward"]:
+                best_name, best_row = name, brow
         if best_row is None:
             continue
         delta = float(rl_mean) - float(best_row["reward"])
@@ -195,6 +208,8 @@ def summarize_scenario_significance(
             "delta": delta,
             "half_ci": half_ci,
             "significant": (abs(delta) > half_ci) if se > 0 else None,
+            "oracle": None if oracle_reward is None else float(oracle_reward),
+            "oracle_gap": None if oracle_reward is None else float(rl_mean) - float(oracle_reward),
         }
     return out
 
@@ -259,8 +274,8 @@ def plot_training_metrics(
     if score_x:
         ax_score = ax.twinx()
         ax_score.plot(score_x, score_y, "s-", ms=3, color="k", lw=1.3, label="balanced_score")
-        ax_score.axhline(0.0, ls=":", lw=0.8, color="0.6")  # 0 = matched best baseline
-        ax_score.set_ylabel("balanced_score (0=best baseline, <0 behind)")
+        ax_score.axhline(0.0, ls=":", lw=0.8, color="0.6")  # 0 = matched best realistic baseline
+        ax_score.set_ylabel("balanced_score (0=best realistic baseline; SJF=oracle, excluded)")
         ax_score.legend(loc="lower right", fontsize=7)
 
     # --- Loss components -----------------------------------------------------

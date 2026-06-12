@@ -133,10 +133,11 @@ def test_summarize_eval_rows_groups_by_scenario() -> None:
 
 
 def _eval_summary_with_scenarios(rl_by_scenario: dict[str, float]) -> dict:
-    # scenario "a": random -100, best baseline (sjf) -50 -> denom 50
-    # scenario "b": random -1000, best baseline (sjf) -500 -> denom 500 (10x scale)
+    # Realistic baselines: random, mlfq (mlfq is the best fair one). sjf_like is
+    # the clairvoyant oracle and must be EXCLUDED from the score.
     baselines = {
-        "random": {"by_scenario": {"a": {"reward": -100.0}, "b": {"reward": -1000.0}}},
+        "random": {"by_scenario": {"a": {"reward": -120.0}, "b": {"reward": -1200.0}}},
+        "mlfq": {"by_scenario": {"a": {"reward": -100.0}, "b": {"reward": -1000.0}}},
         "sjf_like": {"by_scenario": {"a": {"reward": -50.0}, "b": {"reward": -500.0}}},
     }
     return {
@@ -146,45 +147,46 @@ def _eval_summary_with_scenarios(rl_by_scenario: dict[str, float]) -> dict:
     }
 
 
-def test_checkpoint_score_zero_when_matching_best_baseline() -> None:
-    summary = _eval_summary_with_scenarios({"a": -50.0, "b": -500.0})
+def test_checkpoint_score_zero_when_matching_best_realistic_baseline() -> None:
+    # Matching mlfq (best realistic) -> 0. If the oracle sjf were the reference
+    # this would be strongly negative, so this also proves sjf is excluded.
+    summary = _eval_summary_with_scenarios({"a": -100.0, "b": -1000.0})
     assert checkpoint_score(summary) == pytest.approx(0.0)
 
 
-def test_checkpoint_score_positive_when_beating_best_baseline() -> None:
-    # a: (-40 - -50)/50 = +0.2 ; b: (-450 - -500)/500 = +0.1 -> mean 0.15
-    summary = _eval_summary_with_scenarios({"a": -40.0, "b": -450.0})
-    assert checkpoint_score(summary) == pytest.approx(0.15)
+def test_checkpoint_score_positive_when_beating_best_realistic_baseline() -> None:
+    # a: (-90 - -100)/100 = +0.1 ; b: (-950 - -1000)/1000 = +0.05 -> mean 0.075
+    summary = _eval_summary_with_scenarios({"a": -90.0, "b": -950.0})
+    assert checkpoint_score(summary) == pytest.approx(0.075)
 
 
 def test_checkpoint_score_weights_fixed_delta_more_in_low_magnitude_scenario() -> None:
-    # Same absolute 25-reward miss vs the best baseline in both scenarios, but it
-    # is 0.5 of |best| in the small scenario 'a' and only 0.05 in the big 'b'.
-    summary = _eval_summary_with_scenarios({"a": -75.0, "b": -525.0})
-    assert checkpoint_score(summary) == pytest.approx((-0.5 + -0.05) / 2)
+    # Same absolute 10-reward miss vs best realistic in both, but it is 0.1 of
+    # |best| in the small scenario 'a' and only 0.01 in the big 'b'.
+    summary = _eval_summary_with_scenarios({"a": -110.0, "b": -1010.0})
+    assert checkpoint_score(summary) == pytest.approx((-0.1 + -0.01) / 2)
 
 
 def test_checkpoint_score_clamps_a_catastrophic_scenario() -> None:
-    # 'a' is 9x worse than best (rel -9) but clamps to -1 so it can't swamp the
-    # mean; 'b' matches best (0) -> mean -0.5 (unclamped would be -4.5).
-    summary = _eval_summary_with_scenarios({"a": -500.0, "b": -500.0})
+    # 'a' is 10x worse than best realistic (rel -10) but clamps to -1; 'b' matches
+    # best realistic (0) -> mean -0.5 (unclamped would be -5).
+    summary = _eval_summary_with_scenarios({"a": -1100.0, "b": -1000.0})
     assert checkpoint_score(summary) == pytest.approx(-0.5)
 
 
 def test_checkpoint_score_stable_when_baselines_bunch() -> None:
-    # Baselines within a few points of each other: a (rl-random)/(best-random)
-    # span would explode, but dividing by |best_baseline| stays bounded.
+    # Baselines within a few points: dividing by |best realistic| stays bounded.
     summary = {
         "reward": -1.0,
         "by_scenario": {"ui": {"reward": -756.0}},
         "baselines": {
             "random": {"by_scenario": {"ui": {"reward": -711.0}}},
             "mlfq": {"by_scenario": {"ui": {"reward": -705.0}}},
-            "sjf_like": {"by_scenario": {"ui": {"reward": -703.0}}},
+            "sjf_like": {"by_scenario": {"ui": {"reward": -703.0}}},  # oracle, excluded
         },
     }
-    # best = -703, rel = (-756 - -703)/703 = -0.0754 (not an explosion)
-    assert checkpoint_score(summary) == pytest.approx(-53.0 / 703.0)
+    # best realistic = mlfq -705, rel = (-756 - -705)/705 = -0.0723
+    assert checkpoint_score(summary) == pytest.approx(-51.0 / 705.0)
 
 
 def test_checkpoint_score_none_without_scenario_baselines() -> None:
