@@ -10,6 +10,7 @@ from src.plot_metrics import (
     latest_scenario_summary,
     load_metrics,
     plot_training_metrics,
+    summarize_scenario_significance,
 )
 
 
@@ -149,6 +150,38 @@ def test_latest_scenario_summary_extracts_rl_and_baselines() -> None:
     assert bal["sjf_like"] == pytest.approx(-740.0)
     assert bal["eas_like"] == pytest.approx(-840.0)
     assert bal["random"] == pytest.approx(-950.0)
+
+
+def test_summarize_scenario_significance_flags_resolved_gaps() -> None:
+    summary = {
+        "by_scenario": {
+            "x": {"reward": -100.0, "reward_std": 8.0, "n": 4},   # SE = 4.0
+            "y": {"reward": -100.0, "reward_std": 20.0, "n": 4},  # SE = 10.0
+        },
+        "baselines": {
+            "sjf_like": {
+                "by_scenario": {
+                    "x": {"reward": -90.0, "reward_std": 4.0, "n": 16},  # SE = 1.0
+                    "y": {"reward": -95.0, "reward_std": 4.0, "n": 16},  # SE = 1.0
+                }
+            }
+        },
+    }
+
+    sig = summarize_scenario_significance(summary)
+
+    assert sig["x"]["delta"] == pytest.approx(-10.0)
+    assert sig["x"]["best_baseline"] == "sjf_like"
+    assert sig["x"]["significant"] is True   # |-10| > 1.96*sqrt(16+1)=8.08
+    assert sig["y"]["significant"] is False  # |-5| < 1.96*sqrt(100+1)=19.7
+
+
+def test_summarize_scenario_significance_empty_without_std() -> None:
+    summary = {
+        "by_scenario": {"x": {"reward": -100.0}},  # no n / reward_std (old log)
+        "baselines": {"sjf_like": {"by_scenario": {"x": {"reward": -90.0}}}},
+    }
+    assert summarize_scenario_significance(summary) == {}
 
 
 def test_latest_scenario_summary_empty_without_scenario_data() -> None:

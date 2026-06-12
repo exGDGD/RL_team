@@ -145,6 +145,60 @@ def _clip_floor(
     ax.set_ylim(bottom=floor - pad)
 
 
+def _reward_se(row: dict[str, Any]) -> float:
+    """Standard error of a scenario's mean reward: std / sqrt(n) (0 if absent)."""
+    n = row.get("n") or 0
+    std = row.get("reward_std")
+    if not n or std is None:
+        return 0.0
+    return float(std) / float(np.sqrt(n))
+
+
+def summarize_scenario_significance(
+    summary: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Per-scenario RL-vs-best-baseline reward gap with standard errors.
+
+    For judging whether an eval/test sample is large enough: the gap ``Δ = rl -
+    best_baseline`` is only trustworthy when its 95% half-interval
+    (``1.96 * combined_SE``) is smaller than ``|Δ|``. ``SE = reward_std/sqrt(n)``
+    for each side, combined in quadrature. ``significant`` is True when
+    ``|Δ| > 1.96*SE`` (the sample resolves the difference), False when it does
+    not (need more episodes for that scenario), and ``None`` when SE is 0.
+    Returns ``{}`` when std/n are missing (older logs without them).
+    """
+    by_scenario = (summary or {}).get("by_scenario") or {}
+    baselines = (summary or {}).get("baselines") or {}
+    out: dict[str, dict[str, Any]] = {}
+    for scenario, row in by_scenario.items():
+        rl_mean = row.get("reward")
+        if rl_mean is None or "n" not in row:
+            continue
+        best_name, best_row = None, None
+        for name, entry in baselines.items():
+            brow = (entry.get("by_scenario") or {}).get(scenario)
+            if brow and brow.get("reward") is not None:
+                if best_row is None or brow["reward"] > best_row["reward"]:
+                    best_name, best_row = name, brow
+        if best_row is None:
+            continue
+        delta = float(rl_mean) - float(best_row["reward"])
+        se = float(np.sqrt(_reward_se(row) ** 2 + _reward_se(best_row) ** 2))
+        half_ci = 1.96 * se
+        out[scenario] = {
+            "n": int(row.get("n") or 0),
+            "rl": float(rl_mean),
+            "rl_se": _reward_se(row),
+            "best_baseline": best_name,
+            "best": float(best_row["reward"]),
+            "best_se": _reward_se(best_row),
+            "delta": delta,
+            "half_ci": half_ci,
+            "significant": (abs(delta) > half_ci) if se > 0 else None,
+        }
+    return out
+
+
 def plot_training_metrics(
     rows: list[dict[str, Any]],
     *,
