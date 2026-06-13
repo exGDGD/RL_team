@@ -74,6 +74,19 @@ def test_compare_configs_resolves_warm_vs_scratch_delta() -> None:
     assert cmp["balanced"]["resolved"] is True
 
 
+def test_format_report_marks_resolved_loss_as_lose_not_tie() -> None:
+    # RL is consistently far worse than the best realistic baseline across seeds
+    # (e.g. a collapsed warm start). A resolved Δ<0 must read LOSE, not "tie".
+    runs = _runs("warm", [-30000.0, -30100.0, -29900.0], [-39000.0, -39010.0, -38990.0])
+
+    report = format_multiseed_report(runs, seeds=[0, 1, 2])
+
+    assert "LOSE" in report
+    # The collapse line must not be mislabeled as a tie.
+    collapse_line = next(ln for ln in report.splitlines() if ln.strip().startswith("balanced"))
+    assert "LOSE" in collapse_line and "tie" not in collapse_line
+
+
 def test_format_multiseed_report_smoke() -> None:
     runs = _runs("scratch", [-800.0, -795.0, -805.0], [-3600.0, -3620.0, -3580.0])
     runs += _runs("warm", [-780.0, -785.0, -775.0], [-3590.0, -3600.0, -3580.0])
