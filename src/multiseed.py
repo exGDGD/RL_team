@@ -192,7 +192,17 @@ def format_multiseed_report(
         )
         for scenario in sorted(agg[config]):
             s = agg[config][scenario]
-            verdict = "?   " if s["win"] is None else ("WIN " if s["win"] else "tie ")
+            # win is None only when undecidable (single seed / zero variance);
+            # otherwise delta and half_ci are real, so a resolved Δ<0 is a LOSE,
+            # not a "tie" -- the earlier WIN/tie-only display hid real losses.
+            if s["win"] is None:
+                verdict = "?   "
+            elif s["win"]:
+                verdict = "WIN "
+            elif abs(s["delta"]) > s["half_ci"]:
+                verdict = "LOSE"
+            else:
+                verdict = "tie "
             best = "-" if s["best"] is None else f"{s['best_baseline']} {s['best']:+.1f}"
             delta = "-" if s["delta"] is None else f"Δ {s['delta']:+.1f} ±{s['half_ci']:.1f}"
             oracle = "-" if s["oracle_gap"] is None else f"{s['oracle_gap']:+.1f}"
