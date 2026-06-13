@@ -84,6 +84,48 @@ def _latest_baselines(rows: list[dict[str, Any]]) -> dict[str, float]:
     return {}
 
 
+# Policy columns shared by every per-scenario table (RL det/sampled + baselines).
+_POLICY_BASELINES = ("random", "mlfq", "sjf_like", "eas_like")
+
+
+def latest_eval_summary(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The eval summary of the most recent iteration that carries per-scenario
+    data (``None`` for a single-scenario run or an old log)."""
+    for row in reversed(rows):
+        evaluation = row.get("evaluation")
+        if evaluation and evaluation.get("by_scenario"):
+            return evaluation
+    return None
+
+
+def scenario_metric_table(
+    summary: dict[str, Any] | None, metric: str = "reward"
+) -> dict[str, dict[str, Any]]:
+    """Per-scenario values of one ``metric`` for RL (det+sampled) and baselines.
+
+    Works on any eval-summary dict (a training-log ``evaluation`` block or an
+    ``eval_checkpoint`` JSON) -- both share the ``by_scenario`` /
+    ``sampled.by_scenario`` / ``baselines.*.by_scenario`` shape. ``metric`` is a
+    key in those per-scenario rows (``reward``, ``turnaround``, ``response``,
+    ``throughput``, ``completed`` ...). Returns ``{scenario: {"rl", "rl_sampled",
+    "random", "mlfq", "sjf_like", "eas_like"}}`` with ``None`` where absent.
+    """
+    by_scenario = (summary or {}).get("by_scenario") or {}
+    sampled = _pluck(summary or {}, "sampled", "by_scenario") or {}
+    baselines = (summary or {}).get("baselines") or {}
+    table: dict[str, dict[str, Any]] = {}
+    for scenario in sorted(by_scenario):
+        table[scenario] = {
+            "rl": (by_scenario.get(scenario) or {}).get(metric),
+            "rl_sampled": (sampled.get(scenario) or {}).get(metric),
+            **{
+                name: _pluck(baselines, name, "by_scenario", scenario, metric)
+                for name in _POLICY_BASELINES
+            },
+        }
+    return table
+
+
 def latest_scenario_summary(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Per-scenario eval rewards from the most recent evaluated iteration.
 
@@ -91,26 +133,7 @@ def latest_scenario_summary(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
     "eas_like"}}`` (values are rewards or ``None`` when absent). Empty dict when
     no row carries per-scenario eval data (single-scenario run or old log).
     """
-    for row in reversed(rows):
-        by_scenario = _pluck(row, "evaluation", "by_scenario")
-        if not by_scenario:
-            continue
-        summary: dict[str, dict[str, Any]] = {}
-        for scenario in sorted(by_scenario):
-            summary[scenario] = {
-                "rl": _pluck(row, "evaluation", "by_scenario", scenario, "reward"),
-                "rl_sampled": _pluck(
-                    row, "evaluation", "sampled", "by_scenario", scenario, "reward"
-                ),
-                **{
-                    name: _pluck(
-                        row, "evaluation", "baselines", name, "by_scenario", scenario, "reward"
-                    )
-                    for name in ("random", "mlfq", "sjf_like", "eas_like")
-                },
-            }
-        return summary
-    return {}
+    return scenario_metric_table(latest_eval_summary(rows), "reward")
 
 
 def _clip_floor(
@@ -214,6 +237,221 @@ def summarize_scenario_significance(
     return out
 
 
+def _reward_range(
+    values: list[Any],
+    override: float | None = None,
+    *,
+    keep_visible: list[Any] = (),
+) -> list[float] | None:
+    """Same robust reward floor as ``_clip_floor`` but returned as a ``[bottom,
+    top]`` range for an interactive (Plotly) axis. ``None`` when there is too
+    little data to bound (let the plot autoscale)."""
+    finite = [float(v) for v in values if v is not None and np.isfinite(v)]
+    keep = [float(v) for v in keep_visible if v is not None and np.isfinite(v)]
+    if override is not None:
+        bottom = float(override)
+    elif len(finite) >= 4:
+        bottom = float(np.percentile(finite, 5))
+        if keep:
+            bottom = min(bottom, min(keep))
+    else:
+        return None
+    pool = finite + keep
+    if not pool:
+        return None
+    top = max(pool)
+    if not (top > bottom):
+        return None
+    pad = 0.03 * (top - bottom)
+    return [bottom - pad, top + pad]
+
+
+def plot_training_metrics_interactive(
+    rows: list[dict[str, Any]],
+    *,
+    title: str | None = None,
+    reward_floor: float | None = None,
+    save_html: str | Path | None = None,
+    show: bool = True,
+):
+    """Interactive, zoomable Plotly version of the training curves.
+
+    The matplotlib figure renders as a static PNG that Colab cannot zoom into;
+    this one supports box-zoom, pan, double-click autoscale, hover read-out and
+    legend toggling, and mirrors the same panels. ``reward_floor`` sets the
+    initial lower y-limit on the reward panels (``None`` = robust auto floor, but
+    you can always double-click a panel to autoscale). Returns the Plotly Figure.
+    """
+    if not rows:
+        raise ValueError("No metrics rows to plot.")
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ModuleNotFoundError as exc:  # pragma: no cover - environment guard
+        raise SystemExit(
+            "plotly is required for interactive plots. Install it with "
+            "`pip install plotly` (it is preinstalled on Colab)."
+        ) from exc
+
+    fig = make_subplots(
+        rows=5,
+        cols=2,
+        subplot_titles=(
+            "reward (higher = better)",
+            "loss",
+            "entropy & coefficient",
+            "KL & clip fraction",
+            "gradient norm",
+            "decision mix",
+            "eval reward by scenario (deterministic)",
+            "eval reward by scenario (sampled)",
+            "eval turnaround by scenario (lower = better)",
+            "eval throughput by scenario (higher = better)",
+        ),
+        specs=[
+            [{"secondary_y": True}, {}],
+            [{"secondary_y": True}, {"secondary_y": True}],
+            [{}, {}],
+            [{}, {}],
+            [{}, {}],
+        ],
+        vertical_spacing=0.06,
+        horizontal_spacing=0.09,
+    )
+
+    def add(r, c, name, xy, *, secondary_y=False, **kw):
+        xs, ys = xy
+        if not xs:
+            return
+        kw.setdefault("mode", "lines")
+        fig.add_trace(
+            go.Scatter(x=xs, y=ys, name=name, legendgroup=name, **kw),
+            row=r,
+            col=c,
+            secondary_y=secondary_y,
+        )
+
+    iter_x = _series(rows, "reward")[0]
+    xspan = [min(iter_x), max(iter_x)] if iter_x else [0, 1]
+
+    def hline(r, c, y, name, color, *, secondary_y=False, show_legend=True):
+        fig.add_trace(
+            go.Scatter(
+                x=xspan,
+                y=[y, y],
+                mode="lines",
+                name=name,
+                line=dict(color=color, dash="dash", width=1),
+                showlegend=show_legend,
+            ),
+            row=r,
+            col=c,
+            secondary_y=secondary_y,
+        )
+
+    # --- (1,1) reward vs baselines + balanced_score on a secondary axis -------
+    add(1, 1, "train (per-iter avg)", _series(rows, "reward"), line=dict(color="lightgray", width=1))
+    eval_xy = _series(rows, "evaluation", "reward")
+    samp_xy = _series(rows, "evaluation", "sampled", "reward")
+    add(1, 1, "eval (deterministic)", eval_xy, mode="lines+markers", marker=dict(size=4))
+    add(1, 1, "eval (sampled)", samp_xy, mode="lines+markers", marker=dict(size=4))
+    baselines = _latest_baselines(rows)
+    for name, color in (("sjf_like", "green"), ("eas_like", "red"), ("mlfq", "purple"), ("random", "blue")):
+        reward = baselines.get(name)
+        if reward is not None:
+            hline(1, 1, reward, f"{name} {reward:.0f}", color)
+    rng = _reward_range(
+        eval_xy[1] + samp_xy[1] + _series(rows, "reward")[1],
+        reward_floor,
+        keep_visible=list(baselines.values()),
+    )
+    if rng:
+        fig.update_yaxes(range=rng, row=1, col=1, secondary_y=False)
+    score_xy = _series(rows, "evaluation", "balanced_score")
+    if score_xy[0]:
+        add(
+            1,
+            1,
+            "balanced_score",
+            score_xy,
+            mode="lines+markers",
+            marker=dict(size=4, symbol="square"),
+            line=dict(color="black", width=1.5),
+            secondary_y=True,
+        )
+        hline(1, 1, 0.0, "score=0 (best realistic)", "gray", secondary_y=True, show_legend=False)
+        fig.update_yaxes(
+            title_text="balanced_score (0=best realistic; SJF excluded)",
+            row=1,
+            col=1,
+            secondary_y=True,
+        )
+
+    # --- (1,2) loss components ----------------------------------------------
+    for key, label in (("loss", "loss"), ("policy_loss", "policy"), ("value_loss", "value")):
+        add(1, 2, label, _series(rows, "update", key))
+
+    # --- (2,1) entropy + (annealed) coefficient ------------------------------
+    add(2, 1, "entropy (nats)", _series(rows, "update", "entropy"))
+    add(2, 1, "entropy_coef", _series(rows, "update", "entropy_coef"), line=dict(dash="dash"), secondary_y=True)
+    fig.update_yaxes(title_text="entropy_coef", row=2, col=1, secondary_y=True)
+
+    # --- (2,2) KL + clip fraction --------------------------------------------
+    add(2, 2, "approx_kl", _series(rows, "update", "approx_kl"))
+    add(2, 2, "clip_fraction", _series(rows, "update", "clip_fraction"), secondary_y=True)
+    fig.update_yaxes(title_text="clip_fraction", row=2, col=2, secondary_y=True)
+
+    # --- (3,1) gradient norms ------------------------------------------------
+    add(3, 1, "actor", _series(rows, "update", "actor_grad_norm"))
+    add(3, 1, "critic", _series(rows, "update", "critic_grad_norm"))
+
+    # --- (3,2) decision mix --------------------------------------------------
+    add(3, 2, "no-op fraction", _series(rows, "noop_fraction"))
+    add(3, 2, "forced fraction", _series(rows, "forced_decision_fraction"))
+    fig.update_yaxes(range=[0.0, 1.0], row=3, col=2)
+
+    # --- (4,*) per-scenario eval reward (deterministic + sampled) ------------
+    scenarios = sorted(
+        {key for row in rows for key in (_pluck(row, "evaluation", "by_scenario") or {})}
+    )
+    for col, path in ((1, ("evaluation", "by_scenario")), (2, ("evaluation", "sampled", "by_scenario"))):
+        panel_ys: list[Any] = []
+        for scenario in scenarios:
+            xy = _series(rows, *path, scenario, "reward")
+            add(4, col, scenario, xy, mode="lines+markers", marker=dict(size=4))
+            panel_ys.extend(xy[1])
+        rng = _reward_range(panel_ys, reward_floor)
+        if rng:
+            fig.update_yaxes(range=rng, row=4, col=col, secondary_y=False)
+
+    # --- (5,*) per-scenario eval turnaround / throughput (deterministic) -----
+    for col, metric in ((1, "turnaround"), (2, "throughput")):
+        for scenario in scenarios:
+            add(
+                5,
+                col,
+                f"{scenario} ({metric})",
+                _series(rows, "evaluation", "by_scenario", scenario, metric),
+                mode="lines+markers",
+                marker=dict(size=4),
+            )
+
+    fig.update_xaxes(title_text="iteration")
+    fig.update_layout(
+        height=1500,
+        width=1180,
+        title_text=title,
+        hovermode="x unified",
+        legend=dict(font=dict(size=9)),
+        margin=dict(t=70 if title else 50),
+    )
+    if save_html is not None:
+        fig.write_html(str(save_html))
+    if show:
+        fig.show()
+    return fig
+
+
 def plot_training_metrics(
     rows: list[dict[str, Any]],
     *,
@@ -241,7 +479,7 @@ def plot_training_metrics(
             "`pip install matplotlib` (it is preinstalled on Colab)."
         ) from exc
 
-    fig, axes = plt.subplots(4, 2, figsize=(14, 14))
+    fig, axes = plt.subplots(5, 2, figsize=(14, 17))
     if title:
         fig.suptitle(title)
 
@@ -356,6 +594,22 @@ def plot_training_metrics(
         if scenarios:
             ax.legend(fontsize=7)
         _clip_floor(ax, panel_ys, reward_floor)
+
+    # --- Per-scenario eval turnaround / throughput (deterministic) -----------
+    # Turnaround/throughput are the operational read of the same policy: lower
+    # turnaround (and response) and higher throughput is better, complementing
+    # the priority-weighted-flow reward above.
+    for ax, metric, panel_title in (
+        (axes[4, 0], "turnaround", "eval turnaround by scenario (lower = better)"),
+        (axes[4, 1], "throughput", "eval throughput by scenario (higher = better)"),
+    ):
+        for i, scenario in enumerate(scenarios):
+            xs, ys = _series(rows, "evaluation", "by_scenario", scenario, metric)
+            if xs:
+                ax.plot(xs, ys, "o-", ms=3, color=f"C{i}", label=scenario)
+        ax.set_title(panel_title)
+        if scenarios:
+            ax.legend(fontsize=7)
 
     for ax in axes.flat:
         ax.set_xlabel("iteration")

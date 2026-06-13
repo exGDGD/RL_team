@@ -873,6 +873,7 @@ def evaluate_rl_policy(
                     "throughput": metrics.throughput,
                     "preemptions": rollout.preemptions,
                     "turnaround": metrics.mean_turnaround_time,
+                    "response": metrics.mean_response_time,
                 }
             )
 
@@ -921,6 +922,7 @@ def evaluate_baselines(
                     "completed": result.metrics.completed_tasks,
                     "throughput": result.metrics.throughput,
                     "turnaround": result.metrics.mean_turnaround_time,
+                    "response": result.metrics.mean_response_time,
                 }
             )
         summaries[baseline.name] = {
