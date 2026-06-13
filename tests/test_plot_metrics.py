@@ -7,9 +7,11 @@ import pytest
 matplotlib.use("Agg")  # headless: no display needed for the tests
 
 from src.plot_metrics import (
+    latest_eval_summary,
     latest_scenario_summary,
     load_metrics,
     plot_training_metrics,
+    scenario_metric_table,
     summarize_scenario_significance,
 )
 
@@ -62,8 +64,8 @@ def _row(episode: int, *, eval_row: bool) -> dict:
                 },
             },
             "by_scenario": {
-                "balanced": {"reward": -700.0},
-                "ui_heavy": {"reward": -720.0},
+                "balanced": {"reward": -700.0, "turnaround": 12.0, "throughput": 1.5},
+                "ui_heavy": {"reward": -720.0, "turnaround": 14.0, "throughput": 1.2},
             },
         }
         if eval_row
@@ -204,6 +206,51 @@ def test_summarize_scenario_significance_empty_without_std() -> None:
 def test_latest_scenario_summary_empty_without_scenario_data() -> None:
     rows = [_row(i, eval_row=False) for i in range(1, 3)]
     assert latest_scenario_summary(rows) == {}
+
+
+def test_latest_eval_summary_returns_last_eval_block() -> None:
+    rows = [_row(i, eval_row=(i % 2 == 1)) for i in range(1, 6)]
+    ev = latest_eval_summary(rows)
+    assert ev is not None and "by_scenario" in ev
+    # Most recent *evaluated* iteration (i=5 here).
+    assert ev["by_scenario"]["balanced"]["reward"] == -700.0
+
+
+def test_latest_eval_summary_none_without_eval() -> None:
+    rows = [_row(i, eval_row=False) for i in range(1, 4)]
+    assert latest_eval_summary(rows) is None
+
+
+def test_scenario_metric_table_reads_arbitrary_metric() -> None:
+    summary = {
+        "by_scenario": {"balanced": {"reward": -700.0, "turnaround": 12.0}},
+        "sampled": {"by_scenario": {"balanced": {"reward": -740.0, "turnaround": 13.5}}},
+        "baselines": {
+            "mlfq": {"by_scenario": {"balanced": {"reward": -800.0, "turnaround": 15.0}}},
+            "sjf_like": {"by_scenario": {"balanced": {"reward": -745.0, "turnaround": 9.0}}},
+        },
+    }
+
+    table = scenario_metric_table(summary, "turnaround")
+
+    assert table["balanced"]["rl"] == 12.0
+    assert table["balanced"]["rl_sampled"] == 13.5
+    assert table["balanced"]["mlfq"] == 15.0
+    assert table["balanced"]["sjf_like"] == 9.0
+    assert table["balanced"]["random"] is None  # baseline absent -> None, not a KeyError
+
+
+def test_plot_training_metrics_interactive_smoke(tmp_path: Path) -> None:
+    pytest.importorskip("plotly")
+    from src.plot_metrics import plot_training_metrics_interactive
+
+    rows = [_row(i, eval_row=(i % 2 == 1)) for i in range(1, 8)]
+    out = tmp_path / "curves.html"
+
+    fig = plot_training_metrics_interactive(rows, show=False, save_html=out, title="t")
+
+    assert out.exists() and out.stat().st_size > 0
+    assert len(fig.data) > 0  # traces were added (reward/loss/per-scenario/turnaround/...)
 
 
 def test_plot_handles_rows_without_new_fields(tmp_path: Path) -> None:
