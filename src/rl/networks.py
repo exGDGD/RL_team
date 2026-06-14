@@ -20,11 +20,13 @@ class TypeSharedActor(nn.Module):
 
     def __init__(self, hidden_dim: int = 128) -> None:
         super().__init__()
+        self.hidden_dim = hidden_dim
         self.self_encoder = _mlp(SELF_FEATURE_DIM, hidden_dim, hidden_dim)
         self.system_encoder = _mlp(SYSTEM_FEATURE_DIM, hidden_dim, hidden_dim)
         self.other_encoder = _mlp(OTHER_CORE_FEATURE_DIM, hidden_dim, hidden_dim)
         self.task_encoder = _mlp(READY_TASK_FEATURE_DIM, hidden_dim, hidden_dim)
         self.context = _mlp(hidden_dim * 3, hidden_dim, hidden_dim)
+        self.recurrent = nn.GRUCell(hidden_dim, hidden_dim)
         self.noop_head = nn.Linear(hidden_dim, 1)
         self.task_head = _mlp(hidden_dim * 2, hidden_dim, 1, final_activation=False)
 
@@ -37,7 +39,9 @@ class TypeSharedActor(nn.Module):
         other_core_mask: torch.Tensor,
         system: torch.Tensor,
         action_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        actor_hidden: torch.Tensor | None = None,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         self_emb = self.self_encoder(self_features)
         system_emb = self.system_encoder(system)
         other_emb = masked_mean(
@@ -46,15 +50,25 @@ class TypeSharedActor(nn.Module):
             dim=1,
         )
         context = self.context(torch.cat([self_emb, system_emb, other_emb], dim=-1))
+        if actor_hidden is None:
+            actor_hidden = torch.zeros(
+                context.shape[0],
+                self.hidden_dim,
+                dtype=context.dtype,
+                device=context.device,
+            )
+        recurrent_state = self.recurrent(context, actor_hidden)
 
         task_emb = self.task_encoder(ready_queue)
-        expanded_context = context.unsqueeze(1).expand(-1, ready_queue.shape[1], -1)
-        task_logits = self.task_head(torch.cat([task_emb, expanded_context], dim=-1))
+        expanded_state = recurrent_state.unsqueeze(1).expand(-1, ready_queue.shape[1], -1)
+        task_logits = self.task_head(torch.cat([task_emb, expanded_state], dim=-1))
         task_logits = task_logits.squeeze(-1)
-        noop_logits = self.noop_head(context)
+        noop_logits = self.noop_head(recurrent_state)
         logits = torch.cat([noop_logits, task_logits], dim=-1)
         if action_mask is not None:
             logits = mask_logits(logits, action_mask)
+        if return_hidden:
+            return logits, recurrent_state
         return logits
 
 

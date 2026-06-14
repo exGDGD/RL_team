@@ -21,7 +21,7 @@ from src.train_logging import (
 )
 
 
-CHECKPOINT_VERSION = "learnable_actor_filter_v1"
+CHECKPOINT_VERSION = "recurrent_actor_v1"
 
 
 def main() -> None:
@@ -1209,6 +1209,11 @@ class EvaluationPolicy:
     def __init__(self, policy, *, deterministic: bool) -> None:
         self.policy = policy
         self.deterministic = deterministic
+
+    def reset_recurrent_state(self, agent_ids=None):
+        reset = getattr(self.policy, "reset_recurrent_state", None)
+        if callable(reset):
+            reset(agent_ids)
 
     def act(self, batch):
         return self.policy.act(batch, deterministic=self.deterministic)

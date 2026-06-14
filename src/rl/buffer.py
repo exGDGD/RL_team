@@ -21,6 +21,7 @@ class PendingDecision:
     start_time: float
     joint_index: int
     accumulated_reward: float = 0.0
+    actor_hidden: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class AgentTransition:
     elapsed_time: float
     terminated: bool
     truncated: bool
+    actor_hidden: np.ndarray | None = None
 
 
 @dataclass(frozen=True)

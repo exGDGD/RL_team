@@ -11,7 +11,7 @@ from src.train_acac import evaluate_policy, make_env, serialize_args
 from src.train_logging import configure_logging, get_logger
 
 
-IMITATION_CHECKPOINT_VERSION = "sjf_actor_imitation_v1"
+IMITATION_CHECKPOINT_VERSION = "sjf_actor_imitation_recurrent_actor_v1"
 
 
 def main() -> None:

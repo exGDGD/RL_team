@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Protocol
 
+import numpy as np
+
 from src.env import SchedulerEnv
 
 from .buffer import AgentTransition, JointMacroTransition, PendingDecision, RolloutBuffer
@@ -18,6 +20,7 @@ class RolloutPolicy(Protocol):
     ) -> (
         tuple[dict[str, int], dict[str, float]]
         | tuple[dict[str, int], dict[str, float], dict[str, object]]
+        | tuple[dict[str, int], dict[str, float], dict[str, object], dict[str, object]]
     ):
         """Return actions, log-probs, and optionally effective action masks."""
 
@@ -33,13 +36,18 @@ def collect_episode(
     """Collect one episode as agent-centric asynchronous transitions."""
 
     observations, info = env.reset(seed=seed)
+    reset_recurrent = getattr(policy, "reset_recurrent_state", None)
+    if callable(reset_recurrent):
+        reset_recurrent(env.agents)
     batch = build_agent_batch(observations, agent_order=env.agents)
     pending: dict[str, PendingDecision] = {}
     buffer = RolloutBuffer(episodes=1)
 
     for _ in range(max_env_steps):
         actions = {agent_id: 0 for agent_id in env.agents}
-        chosen_actions, log_probs, effective_masks = _unpack_policy_output(policy.act(batch))
+        chosen_actions, log_probs, effective_masks, actor_hiddens = _unpack_policy_output(
+            policy.act(batch)
+        )
         proposed_agent_ids: set[str] = set()
         # Preempt decisions by an already-running core must open their new pending
         # only AFTER this step closes the core's old (now preempted) run, otherwise
@@ -67,6 +75,7 @@ def collect_episode(
                 action=action,
                 log_prob=float(log_probs.get(agent_id, 0.0)),
                 action_mask=effective_masks.get(agent_id, batch.action_mask[agent_index]).copy(),
+                actor_hidden=_copy_hidden(actor_hiddens.get(agent_id)),
                 start_time=interval_start_time,
                 joint_index=current_joint_index,
             )
@@ -172,6 +181,7 @@ def collect_episode(
                         action=decision.action,
                         log_prob=decision.log_prob,
                         action_mask=decision.action_mask,
+                        actor_hidden=decision.actor_hidden,
                         reward=decision.accumulated_reward,
                         next_obs=next_batch,
                         next_agent_index=next_agent_index,
@@ -206,9 +216,18 @@ def collect_episode(
 def _unpack_policy_output(policy_output):
     if len(policy_output) == 2:
         actions, log_probs = policy_output
-        return actions, log_probs, {}
-    actions, log_probs, effective_masks = policy_output
-    return actions, log_probs, effective_masks
+        return actions, log_probs, {}, {}
+    if len(policy_output) == 3:
+        actions, log_probs, effective_masks = policy_output
+        return actions, log_probs, effective_masks, {}
+    actions, log_probs, effective_masks, actor_hiddens = policy_output
+    return actions, log_probs, effective_masks, actor_hiddens
+
+
+def _copy_hidden(hidden):
+    if hidden is None:
+        return None
+    return np.asarray(hidden, dtype=np.float32).copy()
 
 
 def _discard_rejected_decisions(
@@ -292,6 +311,7 @@ def _close_finished_decisions(
                 action=decision.action,
                 log_prob=decision.log_prob,
                 action_mask=decision.action_mask,
+                actor_hidden=decision.actor_hidden,
                 reward=decision.accumulated_reward,
                 next_obs=next_batch,
                 next_agent_index=next_agent_index,

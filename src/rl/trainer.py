@@ -86,16 +86,44 @@ class TorchACACPolicy(nn.Module):
             num_heads=self.config.critic_heads,
         )
         self.to(self.device)
+        self._actor_hidden: dict[str, torch.Tensor] = {}
+
+    def reset_recurrent_state(
+        self,
+        agent_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        """Reset rollout-time actor memory.
+
+        The trainer never uses this mutable state during PPO updates; updates
+        replay the hidden states stored on each transition. This state is only
+        for live action selection during rollout/evaluation.
+        """
+
+        if agent_ids is None:
+            self._actor_hidden.clear()
+            return
+        for agent_id in agent_ids:
+            self._actor_hidden[agent_id] = torch.zeros(
+                self.config.hidden_dim,
+                dtype=torch.float32,
+                device=self.device,
+            )
 
     def act(
         self,
         batch: AgentBatch,
         *,
         deterministic: bool = False,
-    ) -> tuple[dict[str, int], dict[str, float], dict[str, np.ndarray]]:
+    ) -> tuple[
+        dict[str, int],
+        dict[str, float],
+        dict[str, np.ndarray],
+        dict[str, np.ndarray],
+    ]:
         actions = {agent_id: 0 for agent_id in batch.agent_ids}
         log_probs = {agent_id: 0.0 for agent_id in batch.agent_ids}
         effective_masks: dict[str, np.ndarray] = {}
+        actor_hiddens: dict[str, np.ndarray] = {}
         claimed_slots: set[int] = set()
 
         decision_rows = [
@@ -103,8 +131,7 @@ class TorchACACPolicy(nn.Module):
             for row in range(len(batch.agent_ids))
             if bool(batch.decision_mask[row])
         ]
-        if not decision_rows:
-            return actions, log_probs, effective_masks
+        decision_row_set = set(decision_rows)
 
         with torch.no_grad():
             # Forward pass batched per core type (one call per type instead of
@@ -114,8 +141,9 @@ class TorchACACPolicy(nn.Module):
             # and RNG draw order of the unbatched implementation.
             raw_logits: dict[int, torch.Tensor] = {}
             base_masks: dict[int, torch.Tensor] = {}
+            next_hidden_by_row: dict[int, torch.Tensor] = {}
             rows_by_type: dict[CoreType, list[int]] = {}
-            for row in decision_rows:
+            for row in range(len(batch.agent_ids)):
                 core_type = list(CoreType)[int(batch.core_type_indices[row])]
                 rows_by_type.setdefault(core_type, []).append(row)
             for core_type, rows in rows_by_type.items():
@@ -123,10 +151,37 @@ class TorchACACPolicy(nn.Module):
                 tensors = self._apply_policy_action_mask(tensors)
                 actor_inputs = _actor_inputs(tensors)
                 actor_inputs["action_mask"] = None
-                logits = self.actors[core_type.value](**actor_inputs)
+                hidden = torch.stack(
+                    [
+                        self._actor_hidden.get(
+                            batch.agent_ids[row],
+                            torch.zeros(
+                                self.config.hidden_dim,
+                                dtype=torch.float32,
+                                device=self.device,
+                            ),
+                        )
+                        for row in rows
+                    ]
+                )
                 for offset, row in enumerate(rows):
-                    raw_logits[row] = logits[offset]
-                    base_masks[row] = tensors["action_mask"][offset]
+                    if row in decision_row_set:
+                        actor_hiddens[batch.agent_ids[row]] = (
+                            hidden[offset].detach().cpu().numpy().astype(np.float32)
+                        )
+                logits, next_hidden = self.actors[core_type.value](
+                    **actor_inputs,
+                    actor_hidden=hidden,
+                    return_hidden=True,
+                )
+                for offset, row in enumerate(rows):
+                    next_hidden_by_row[row] = next_hidden[offset].detach()
+                    if row in decision_row_set:
+                        raw_logits[row] = logits[offset]
+                        base_masks[row] = tensors["action_mask"][offset]
+
+            for row, next_hidden in next_hidden_by_row.items():
+                self._actor_hidden[batch.agent_ids[row]] = next_hidden
 
             for row in decision_rows:
                 agent_id = batch.agent_ids[row]
@@ -154,7 +209,7 @@ class TorchACACPolicy(nn.Module):
                 if action > 0:
                     claimed_slots.add(action)
 
-        return actions, log_probs, effective_masks
+        return actions, log_probs, effective_masks, actor_hiddens
 
     def evaluate_transitions(
         self,
@@ -178,6 +233,7 @@ class TorchACACPolicy(nn.Module):
 
         for core_type, positions in groups.items():
             rows = []
+            hidden_rows = []
             for position in positions:
                 transition = transitions[position]
                 raw = _raw_rows_to_tensors(
@@ -191,8 +247,18 @@ class TorchACACPolicy(nn.Module):
                     device=self.device,
                 ).unsqueeze(0)
                 rows.append(raw)
+                hidden_rows.append(
+                    _transition_actor_hidden(
+                        transition,
+                        hidden_dim=self.config.hidden_dim,
+                        device=self.device,
+                    )
+                )
             batched = normalize_observation_tensors(_stack_tensor_dicts(rows))
-            logits = self.actors[core_type.value](**_actor_inputs(batched))
+            logits = self.actors[core_type.value](
+                **_actor_inputs(batched),
+                actor_hidden=torch.stack(hidden_rows),
+            )
             dist = Categorical(logits=logits)
             chosen = torch.tensor(
                 [transitions[position].action for position in positions],
@@ -578,6 +644,17 @@ def map_actor_advantages(
         [joint_advantages[transition.joint_index] for transition in transitions],
         dtype=np.float32,
     )
+
+
+def _transition_actor_hidden(
+    transition: AgentTransition,
+    *,
+    hidden_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if transition.actor_hidden is None:
+        return torch.zeros(hidden_dim, dtype=torch.float32, device=device)
+    return torch.as_tensor(transition.actor_hidden, dtype=torch.float32, device=device)
 
 
 def _chunk(items: list[int], num_chunks: int) -> list[list[int]]:

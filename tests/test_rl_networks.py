@@ -31,6 +31,26 @@ def test_type_shared_actor_outputs_masked_action_logits() -> None:
     assert logits[1, 1].item() < -1.0e8
 
 
+def test_type_shared_actor_returns_recurrent_state() -> None:
+    actor = TypeSharedActor(hidden_dim=16)
+    batch_size = 2
+    queue_size = 5
+
+    logits, hidden = actor(
+        self_features=torch.zeros(batch_size, 8),
+        ready_queue=torch.zeros(batch_size, queue_size, 4),
+        ready_mask=torch.ones(batch_size, queue_size),
+        other_cores=torch.zeros(batch_size, 2, 3),
+        other_core_mask=torch.ones(batch_size, 2),
+        system=torch.zeros(batch_size, 6),
+        actor_hidden=torch.zeros(batch_size, 16),
+        return_hidden=True,
+    )
+
+    assert logits.shape == (batch_size, queue_size + 1)
+    assert hidden.shape == (batch_size, 16)
+
+
 def test_agent_centric_critic_outputs_one_value_per_agent() -> None:
     critic = AgentCentricCritic(hidden_dim=16, num_heads=4)
     batch_size = 3

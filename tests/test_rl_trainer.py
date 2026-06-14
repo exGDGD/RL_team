@@ -133,6 +133,24 @@ def test_torch_acac_policy_can_update_from_collected_rollout() -> None:
     )
 
 
+def test_torch_policy_rollout_stores_actor_hidden_state() -> None:
+    env = SchedulerEnv(
+        core_config={CoreType.P: 1},
+        workload_scenario=WorkloadScenario.BALANCED,
+        arrival_rate=2.0,
+        episode_time=30.0,
+        max_tasks=8,
+        seed=3,
+    )
+    policy = TorchACACPolicy(ACACConfig(hidden_dim=16, critic_heads=4))
+
+    rollout = collect_episode(env, policy, seed=3)
+
+    assert rollout.transitions
+    assert all(transition.actor_hidden is not None for transition in rollout.transitions)
+    assert all(transition.actor_hidden.shape == (16,) for transition in rollout.transitions)
+
+
 def _balanced_rollout(seed: int = 3):
     env = SchedulerEnv(
         core_config={CoreType.P: 1},
