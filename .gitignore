@@ -22,3 +22,6 @@ Anaconda*.sh
 
 # Generated code-analysis artifact (understand-anything knowledge graph)
 .understand-anything/
+
+docs/
+notebooks/

@@ -61,8 +61,8 @@ class SchedulerEnv:
     the next scheduling decision, asks idle cores to select ready-queue slots,
     then runs CPU/I/O events until the next decision point.
 
-    The public API intentionally resembles PettingZoo's ParallelEnv shape:
-    actions and observations are dictionaries keyed by core/agent id.
+    The public API uses a ParallelEnv-like shape: actions and observations are
+    dictionaries keyed by core/agent id.
 
     Semantics fixed in this simulator:
     - An action selects from the ready-queue snapshot visible at step start.
