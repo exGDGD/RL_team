@@ -211,31 +211,6 @@ Interpretation:
 Raw reward, turnaround, throughput, and per-scenario results should still be
 reported alongside `balanced_score`.
 
-## Optional SJF Imitation Warm Start
-
-`src.train_sjf_imitation` is included as an optional diagnostic and warm-start
-tool. It trains actor weights to imitate SJF-like labels generated from simulator
-internals.
-
-This path is:
-
-- optional, not required for default training;
-- not a baseline;
-- not a purely from-scratch RL result;
-- based on oracle-style SJF-like labels, so runs using it should be reported
-  separately.
-
-Example:
-
-```bash
-python -m src.train_sjf_imitation \
-  --device cpu \
-  --output outputs/sjf_imitation/actors.pt
-
-python -m src.train_acac \
-  --reward-mode latency_flow \
-  --pretrained-actors outputs/sjf_imitation/actors.pt \
-  --output-dir outputs/acac_sjf_warm_start
 ```
 
 ## Current Result Interpretation
